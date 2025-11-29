@@ -1,0 +1,688 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Прогноз черги ВЛК</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/date-fns/locale/uk/index.js"></script> 
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jstat/1.9.6/jstat.min.js"></script>
+    <style>
+        body { font-family: sans-serif; margin: 20px; }
+        #loading { font-style: italic; color: #666; }
+        #chart-container { position: relative; height: 80vh; width: 100%; }
+        .error { color: red; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <h1>Прогноз черги ВЛК на Закревського 81/1</h1>
+    <div id="loading">Завантаження даних з Google Таблиці...</div>
+    <div id="error" class="error"></div>
+    
+    <div style="margin-bottom: 10px;">
+        <input type="number" id="queueInput" placeholder="Введіть номер черги" style="padding: 5px; width: 150px;">
+        <button id="findBtn" style="padding: 5px 10px; cursor: pointer;">Показати прогноз</button>
+    </div>
+
+    <div id="chart-container">
+        <canvas id="queueChart"></canvas>
+    </div>
+    
+    <div style="margin-top: 10px; font-style: italic; color: #666; font-size: 0.9em;">
+        Примітка: Попередні записи на дати, що віддалені більш ніж на 3 місяці від останньої історичної дати, на графіку не відображаються.
+    </div>
+
+    <script>
+        // Google Sheet CSV URL
+        const SHEET_ID = '1d9OG-0b7wxxqrOujC9v6ikhjMKL2ei3wfrfaG61zSjA';
+        const GID = '822507513';
+        const MAX_ID_GID = '84071606'; // Sheet to find max ID
+        
+        // Use a CORS proxy to handle redirects and CORS headers
+        const CSV_URL = 'https://corsproxy.io/?' + encodeURIComponent(`https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&gid=${GID}`);
+        const MAX_ID_URL = 'https://corsproxy.io/?' + encodeURIComponent(`https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&gid=${MAX_ID_GID}`);
+
+        // --- Helper Functions ---
+
+        function parseDate(dateStr) {
+            // Format: DD.MM.YYYY
+            const match = dateStr.match(/(\d{2})\.(\d{2})\.(\d{4})/);
+            if (!match) return null;
+            return new Date(match[3], match[2] - 1, match[1]); // Y, M-1, D
+        }
+
+        function toOrdinal(date) {
+            const msPerDay = 24 * 60 * 60 * 1000;
+            return Math.floor(date.getTime() / msPerDay); // JS epoch days
+        }
+
+        function fromOrdinal(ordinal) {
+            const msPerDay = 24 * 60 * 60 * 1000;
+            return new Date(ordinal * msPerDay);
+        }
+
+        // --- Regression Logic ---
+
+        function weightedLinearRegression(x, y, weights) {
+            const n = x.length;
+            let sumW = 0;
+            let sumWX = 0;
+            let sumWY = 0;
+            let sumWXX = 0;
+            let sumWXY = 0;
+
+            for (let i = 0; i < n; i++) {
+                const w = weights[i];
+                sumW += w;
+                sumWX += w * x[i];
+                sumWY += w * y[i];
+                sumWXX += w * x[i] * x[i];
+                sumWXY += w * x[i] * y[i];
+            }
+
+            const denom = sumW * sumWXX - sumWX * sumWX;
+            if (denom === 0) return { slope: 0, intercept: 0 };
+
+            const slope = (sumW * sumWXY - sumWX * sumWY) / denom;
+            const intercept = (sumWY - slope * sumWX) / sumW;
+
+            return { slope, intercept };
+        }
+
+        // --- Data Processing & Charting ---
+
+        Promise.all([
+            new Promise((resolve, reject) => {
+                Papa.parse(CSV_URL, {
+                    download: true,
+                    header: true,
+                    complete: results => resolve(results.data),
+                    error: err => reject(err)
+                });
+            }),
+            new Promise((resolve, reject) => {
+                Papa.parse(MAX_ID_URL, {
+                    download: true,
+                    header: false, // Column B is just data, maybe no header or simple structure
+                    complete: results => resolve(results.data),
+                    error: err => reject(err)
+                });
+            })
+        ]).then(([queueData, maxIdData]) => {
+            document.getElementById('loading').style.display = 'none';
+            try {
+                processAndRender(queueData, maxIdData);
+            } catch (e) {
+                console.error(e);
+                document.getElementById('error').textContent = "Error: " + e.message;
+            }
+        }).catch(err => {
+            document.getElementById('loading').style.display = 'none';
+            document.getElementById('error').textContent = "Failed to load data: " + err.message;
+        });
+
+        function processAndRender(data, maxIdRows) {
+            // 0. Find Global Max ID from second sheet (Column B -> Index 1)
+            // Also extract "Pre-booked" data points (ID in Col B, Date in Col C)
+            
+            let globalMaxId = 0;
+            const preBookedData = [];
+
+            maxIdRows.forEach(row => {
+                // Skip header rows or empty rows
+                // Row structure based on CSV check: [No, ID, Date, Note, ...]
+                // We need ID (index 1) and Date (index 2)
+                // ID should be numeric.
+                
+                if (Array.isArray(row) && row.length > 2) {
+                    const idStr = String(row[1]).trim();
+                    const dateStr = String(row[2]).trim();
+                    
+                    // Simple check if it looks like an ID
+                    // Filter out non-digits to be safe, but also ensure it's not a header like "ID"
+                    if (!/^\d+$/.test(idStr)) return; 
+                    
+                    const id = parseInt(idStr, 10);
+                    if (isNaN(id)) return;
+
+                    // Update Max ID
+                    if (id > globalMaxId) globalMaxId = id;
+
+                    // Parse Date for Pre-booked plot
+                    // Format DD.MM.YYYY
+                    const date = parseDate(dateStr);
+                    if (date) {
+                        preBookedData.push({ id: id, date: date });
+                    }
+                }
+            });
+            
+            // If globalMaxId is suspiciously high (like 48000), we might have parsed a phone number or bad data?
+            // User said "actual max is around 5100, not 48k". 
+            // Let's add a sanity filter: ID must be < 20000? 
+            // Or just trust the regex ^\d+$ which excludes "48k".
+            // The issue might have been row index confusion or a stray value.
+            // With /^\d+$/ check, we should be safer.
+            
+            // Add buffer (100)
+            const targetEndId = globalMaxId > 0 ? globalMaxId + 100 : 5500;
+
+            // 1. Parse & Filter Data (Historical)
+            const validData = [];
+            let maxId = 0;
+            let maxDateOrdinal = 0;
+
+            data.forEach(row => {
+                const dateStr = row['Дата прийому'];
+                const idStr = row['Останній номер що зайшов'];
+                if (!dateStr || !idStr) return;
+
+                const date = parseDate(dateStr);
+                // Remove non-digits to handle "123 (approx)" cases if any
+                const id = parseInt(idStr.replace(/\D/g, '')); 
+
+                if (date && !isNaN(id)) {
+                    const ordinal = toOrdinal(date);
+                    validData.push({ id, date, ordinal });
+                    if (id > maxId) maxId = id;
+                    if (ordinal > maxDateOrdinal) maxDateOrdinal = ordinal;
+                }
+            });
+
+            validData.sort((a, b) => a.ordinal - b.ordinal);
+
+            if (validData.length === 0) throw new Error("Дійсних даних не знайдено.");
+
+            // Filter Pre-booked Data outliers (> 3 months from last historical date)
+            const lastHistoricalDateOrdinal = validData[validData.length - 1].ordinal;
+            const cutoffOrdinal = lastHistoricalDateOrdinal + (90); // Approx 3 months (90 days)
+            
+            // Filter in place or create new array
+            // We need to filter preBookedData which was passed in
+            // However, preBookedData is an array of objects {id, date} (JS Date objects)
+            
+            // Let's convert cutoff to JS Date timestamp comparison for simplicity or re-calculate ordinal
+            // The ordinal helper is simple: day count.
+            
+            const filteredPreBookedData = preBookedData.filter(d => {
+                const ord = toOrdinal(d.date);
+                // Filter if date is way too far in future (outlier)
+                // e.g. > 3 months from last known processed date
+                return ord <= cutoffOrdinal;
+            });
+
+            // 2. Prepare Regression Input
+            const X = validData.map(d => d.id); // Predictor: Queue ID
+            const Y = validData.map(d => d.ordinal); // Target: Date
+            const n = validData.length;
+
+            // Weights: Exponential decay e^(-3) -> e^0
+            const weights = [];
+            for (let i = 0; i < n; i++) {
+                const val = -3 + (i / (n - 1)) * 3;
+                weights.push(Math.exp(val));
+            }
+
+            // 3. Train Model
+            const model = weightedLinearRegression(X, Y, weights);
+
+            // 4. Calculate Statistics for Intervals
+            let sumW = 0;
+            let weightedMeanX = 0;
+            for(let i=0; i<n; i++) {
+                sumW += weights[i];
+                weightedMeanX += weights[i] * X[i];
+            }
+            weightedMeanX /= sumW;
+
+            let weightedVarX = 0;
+            let weightedSumResSq = 0;
+            for(let i=0; i<n; i++) {
+                weightedVarX += weights[i] * Math.pow(X[i] - weightedMeanX, 2);
+                const yPred = model.slope * X[i] + model.intercept;
+                const res = Y[i] - yPred;
+                weightedSumResSq += weights[i] * res * res;
+            }
+
+            const degreesOfFreedom = sumW - 2;
+            const mseWeighted = weightedSumResSq / degreesOfFreedom;
+
+            // T-scores
+            // 95% confidence -> alpha=0.05, two-tailed -> 0.975
+            const tScore95 = jStat.studentt.inv(0.975, degreesOfFreedom);
+            // 50% confidence -> alpha=0.50, two-tailed -> 0.75
+            const tScore50 = jStat.studentt.inv(0.75, degreesOfFreedom);
+
+            // 5. Generate Prediction Data Points
+            // We want to plot Queue ID on Y axis, Date on X axis.
+            // Chart.js Scatter: x=Date, y=ID
+            
+            const startId = maxId;
+            const endId = targetEndId; 
+            const minFeasibleOrdinal = maxDateOrdinal + 1; // Next day after last history
+
+            // We generate dense points for the prediction lines
+            const predPoints = [];
+            
+            // Use step of 1 for maximum vertical resolution
+            for (let qId = startId; qId <= endId; qId += 1) {
+                let predOrd = model.slope * qId + model.intercept;
+                
+                // Standard Error
+                const term3 = Math.pow(qId - weightedMeanX, 2) / weightedVarX;
+                const sePred = Math.sqrt(mseWeighted * (1 + 1/sumW + term3));
+
+                const margin95 = tScore95 * sePred;
+                const margin50 = tScore50 * sePred;
+
+                let l95 = predOrd - margin95;
+                let h95 = predOrd + margin95;
+                let l50 = predOrd - margin50;
+                let h50 = predOrd + margin50;
+
+                // Logic Clamp: Future predictions cannot be in the past
+                if (qId > maxId) {
+                    if (predOrd < minFeasibleOrdinal) predOrd = minFeasibleOrdinal;
+                    if (l95 < minFeasibleOrdinal) l95 = minFeasibleOrdinal;
+                    if (l50 < minFeasibleOrdinal) l50 = minFeasibleOrdinal;
+                }
+
+                // Sort bounds
+                if (l95 > predOrd) l95 = predOrd;
+                if (h95 < predOrd) h95 = predOrd;
+                if (l50 > predOrd) l50 = predOrd;
+                if (h50 < predOrd) h50 = predOrd;
+
+                predPoints.push({
+                    id: qId,
+                    mean: fromOrdinal(predOrd),
+                    l95: fromOrdinal(l95),
+                    h95: fromOrdinal(h95),
+                    l50: fromOrdinal(l50),
+                    h50: fromOrdinal(h50)
+                });
+            }
+
+            // 6. Chart.js Data Structure
+            
+            // Historical Points
+            const histData = validData.map(d => ({ x: d.date, y: d.id }));
+            
+            // Pre-booked Points (From second sheet, filtered)
+            const preBookedChartData = filteredPreBookedData.map(d => ({ x: d.date, y: d.id }));
+
+            // Mean Line
+            const meanData = predPoints.map(p => ({ x: p.mean, y: p.id }));
+            
+            // Confidence Intervals (Filled Areas)
+            // Chart.js 'fill' requires a boundary.
+            // We create two lines for each interval: Upper and Lower.
+            // We fill Upper to Lower.
+            
+            const l95Data = predPoints.map(p => ({ x: p.l95, y: p.id }));
+            const h95Data = predPoints.map(p => ({ x: p.h95, y: p.id }));
+            const l50Data = predPoints.map(p => ({ x: p.l50, y: p.id }));
+            const h50Data = predPoints.map(p => ({ x: p.h50, y: p.id }));
+
+            renderChart(histData, preBookedChartData, meanData, l95Data, h95Data, l50Data, h50Data);
+        }
+
+        function renderChart(histData, preBookedData, meanData, l95Data, h95Data, l50Data, h50Data) {
+            const ctx = document.getElementById('queueChart').getContext('2d');
+            
+            // Helper to freeze chart at a specific ID
+            // Defined here to access the data arrays via closure
+            const freezeAtId = (chart, targetId) => {
+                // Find nearest point in meanData
+                const nearest = meanData.reduce((prev, curr) => 
+                    Math.abs(curr.y - targetId) < Math.abs(prev.y - targetId) ? curr : prev
+                );
+                
+                // Find matching bounds index
+                const idx = meanData.indexOf(nearest);
+                
+                // Check if this ID exists in Historical or Pre-booked data
+                let actualDate = null;
+                let actualType = null; // 'Historical' or 'Pre-booked'
+                
+                // Check Historical
+                const histMatch = histData.find(d => d.y === targetId);
+                if (histMatch) {
+                    actualDate = histMatch.x;
+                    actualType = 'Історична дата';
+                } else {
+                    // Check Pre-booked
+                    const preBookedMatch = preBookedData.find(d => d.y === targetId);
+                    if (preBookedMatch) {
+                        actualDate = preBookedMatch.x;
+                        actualType = 'Запис на';
+                    }
+                }
+                
+                if (idx !== -1) {
+                    chart.frozen = true;
+                    chart.options.plugins.tooltip.enabled = false;
+                    
+                    chart.frozenData = {
+                        id: nearest.y,
+                        mean: nearest.x,
+                        l95: l95Data[idx].x,
+                        h95: h95Data[idx].x,
+                        l50: l50Data[idx].x,
+                        h50: h50Data[idx].x,
+                        actualDate: actualDate,
+                        actualType: actualType
+                    };
+                    chart.update();
+                }
+            };
+
+            // Custom Plugin for Freeze Behavior
+            const freezePlugin = {
+                id: 'freezeTooltip',
+                defaults: {
+                    frozen: false,
+                    frozenX: null,
+                    frozenY: null,
+                    frozenData: null
+                },
+                afterInit: (chart) => {
+                    chart.frozen = false;
+                    
+                    // Bind external input controls
+                    const input = document.getElementById('queueInput');
+                    const btn = document.getElementById('findBtn');
+                    
+                    const handleSearch = () => {
+                        const val = parseInt(input.value, 10);
+                        if (!isNaN(val)) {
+                            freezeAtId(chart, val);
+                        }
+                    };
+                    
+                    btn.addEventListener('click', handleSearch);
+                    input.addEventListener('keypress', (e) => {
+                        if (e.key === 'Enter') handleSearch();
+                    });
+                    
+                    // Handle click to freeze/unfreeze
+                    chart.canvas.addEventListener('click', (e) => {
+                        if (chart.frozen) {
+                            // Unfreeze
+                            chart.frozen = false;
+                            chart.options.plugins.tooltip.enabled = true; // Re-enable native
+                            
+                            // Remove custom guides
+                            // We handle drawing in afterDraw, so just forcing update clears them
+                            chart.update();
+                        } else {
+                            // Freeze
+                            // Get data under cursor
+                            const points = chart.getElementsAtEventForMode(e, 'nearest', { intersect: false, axis: 'y' }, true);
+                            
+                            if (points.length) {
+                                // Use the click Y value to find target
+                                const yValue = chart.scales.y.getValueForPixel(e.offsetY);
+                                const targetY = Math.round(yValue);
+                                
+                                freezeAtId(chart, targetY);
+                            }
+                        }
+                    });
+                },
+                afterDraw: (chart) => {
+                    if (chart.frozen && chart.frozenData) {
+                        const ctx = chart.ctx;
+                        const data = chart.frozenData;
+                        
+                        // Get Pixels
+                        const yPix = chart.scales.y.getPixelForValue(data.id);
+                        const xPixMean = chart.scales.x.getPixelForValue(data.mean.getTime());
+                        
+                        // Draw Guides
+                        ctx.save();
+                        ctx.beginPath();
+                        ctx.strokeStyle = 'gray';
+                        ctx.setLineDash([5, 5]);
+                        ctx.lineWidth = 1;
+                        
+                        // Horizontal Line
+                        ctx.moveTo(chart.chartArea.left, yPix);
+                        ctx.lineTo(chart.chartArea.right, yPix);
+                        
+                        // Vertical Line at Mean
+                        ctx.moveTo(xPixMean, chart.chartArea.top);
+                        ctx.lineTo(xPixMean, chart.chartArea.bottom);
+                        
+                        // If Actual Data exists, draw Vertical Line at Actual Date
+                        if (data.actualDate) {
+                            const xPixActual = chart.scales.x.getPixelForValue(data.actualDate.getTime());
+                            
+                            // Move to actual date
+                            ctx.moveTo(xPixActual, chart.chartArea.top);
+                            ctx.lineTo(xPixActual, chart.chartArea.bottom);
+                            
+                            // Highlight the point intersection (optional circle)
+                            // ctx.moveTo(xPixActual + 3, yPix);
+                            // ctx.arc(xPixActual, yPix, 3, 0, 2 * Math.PI);
+                        }
+                        
+                        ctx.stroke();
+                        
+                        // Draw Tooltip Box
+                        const formatDate = (d) => d.toISOString().split('T')[0];
+                        
+                        const textLines = [
+                            `Номер у черзі: ${data.id}`,
+                            `5% шансу: ${formatDate(data.l95)}`,
+                            `25% шансу: ${formatDate(data.l50)}`,
+                            `50% шансу: ${formatDate(data.mean)}`,
+                            `75% шансу: ${formatDate(data.h50)}`,
+                            `95% шансу: ${formatDate(data.h95)}`
+                        ];
+                        
+                        // Add actual date info if available
+                        if (data.actualDate) {
+                            // Add separator or just append
+                            textLines.unshift(`${data.actualType}: ${formatDate(data.actualDate)}`);
+                        }
+                        
+                        // Box settings
+                        const padding = 10;
+                        const lineHeight = 20;
+                        const boxWidth = 220; // Increased width for potentially longer labels
+                        const boxHeight = textLines.length * lineHeight + padding * 2;
+                        
+                        // Position box to the left of the point if possible
+                        // If actual date exists and is far from mean, we still position relative to Mean for consistency,
+                        // or maybe to the left of the leftmost line? Let's stick to Mean.
+                        
+                        let boxX = xPixMean - boxWidth - 20;
+                        let boxY = yPix - boxHeight / 2;
+                        
+                        // Clamp to chart area
+                        if (boxX < chart.chartArea.left) boxX = xPixMean + 20;
+                        if (boxY < chart.chartArea.top) boxY = chart.chartArea.top;
+                        
+                        // Background
+                        ctx.fillStyle = 'rgba(255, 255, 255, 0.9)';
+                        ctx.strokeStyle = 'black';
+                        ctx.setLineDash([]);
+                        ctx.fillRect(boxX, boxY, boxWidth, boxHeight);
+                        ctx.strokeRect(boxX, boxY, boxWidth, boxHeight);
+                        
+                        // Text
+                        ctx.fillStyle = 'black';
+                        ctx.font = '12px sans-serif';
+                        ctx.textAlign = 'left';
+                        ctx.textBaseline = 'middle';
+                        
+                        textLines.forEach((line, i) => {
+                            // Bold: Queue ID (which is index 1 if actual exists, or 0) and Mean (which is index 4 or 3)
+                            // Logic:
+                            // If actual exists: 0=Actual, 1=ID, 2=5%, 3=25%, 4=Mean...
+                            // If not: 0=ID, 1=5%, 2=25%, 3=Mean...
+                            
+                            const hasActual = !!data.actualDate;
+                            let isBold = false;
+                            
+                            if (hasActual) {
+                                if (i === 0 || i === 1 || i === 4) isBold = true; // Actual, ID, Mean
+                            } else {
+                                if (i === 0 || i === 3) isBold = true; // ID, Mean
+                            }
+                            
+                            ctx.font = isBold ? 'bold 12px sans-serif' : '12px sans-serif';
+                            ctx.fillText(line, boxX + padding, boxY + padding + i * lineHeight + lineHeight/2);
+                        });
+                        
+                        ctx.restore();
+                    }
+                }
+            };
+
+            new Chart(ctx, {
+                type: 'scatter',
+                data: {
+                    datasets: [
+                        {
+                            label: 'Історичні дані',
+                            data: histData,
+                            backgroundColor: 'rgba(0, 0, 0, 0.6)',
+                            pointRadius: 3,
+                            order: 1
+                        },
+                        {
+                            label: 'Попередньо записані',
+                            data: preBookedData,
+                            backgroundColor: 'rgba(255, 165, 0, 0.8)', // Solid Orange
+                            borderColor: 'rgba(255, 140, 0, 1)',
+                            borderWidth: 1,
+                            pointRadius: 4,
+                            pointStyle: 'rectRot', 
+                            order: 0 // Topmost layer
+                        },
+                        {
+                            label: 'Прогноз (Середнє)',
+                            data: meanData,
+                            borderColor: 'blue',
+                            borderWidth: 2,
+                            showLine: true,
+                            pointRadius: 0, // Hide points for lines
+                            order: 2
+                        },
+                        // Confidence Intervals (Hidden from plot, but data kept for freeze tooltip)
+                        {
+                            label: '95% Верхня',
+                            data: h95Data,
+                            borderColor: 'transparent',
+                            pointRadius: 0,
+                            fill: false, 
+                            order: 3,
+                            hidden: true // Hide from legend and plot
+                        },
+                        {
+                            label: '95% Нижня',
+                            data: l95Data,
+                            borderColor: 'transparent',
+                            pointRadius: 0,
+                            fill: false, 
+                            order: 4,
+                            hidden: true // Hide from legend and plot
+                        },
+                        {
+                            label: '50% Верхня',
+                            data: h50Data,
+                            borderColor: 'transparent',
+                            pointRadius: 0,
+                            fill: false, 
+                            order: 5,
+                            hidden: true // Hide from legend and plot
+                        },
+                        {
+                            label: '50% Нижня',
+                            data: l50Data,
+                            borderColor: 'transparent',
+                            pointRadius: 0,
+                            fill: false, 
+                            order: 6,
+                            hidden: true // Hide from legend and plot
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    scales: {
+                        x: {
+                            type: 'time',
+                            time: {
+                                unit: 'week',
+                                displayFormats: { week: 'yyyy-MM-dd' }
+                            },
+                            adapters: { 
+                                date: {
+                                    locale: window.dateFns ? window.dateFns.locale.uk : undefined
+                                }
+                            },
+                            title: { display: true, text: 'Дата' }
+                        },
+                        y: {
+                            title: { display: true, text: 'Номер у черзі' }
+                        }
+                    },
+                    plugins: {
+                        legend: {
+                            // Only show Hist and Mean
+                            labels: {
+                                filter: function(item, chart) {
+                                    // Hide if hidden property is true (which we set for CI)
+                                    // Logic: item.hidden is true if user clicked to hide it. 
+                                    // But we set 'hidden: true' in dataset config.
+                                    // Chart.js default filter shows all unless we override.
+                                    
+                                    // We want to hide datasets 2,3,4,5 (indices) from legend
+                                    // Or check label text
+                                    const text = item.text || '';
+                                    return !text.includes('%'); 
+                                }
+                            }
+                        },
+                        tooltip: {
+                            mode: 'nearest',
+                            axis: 'y',
+                            intersect: false,
+                            callbacks: {
+                                title: function(context) {
+                                    // Show Queue ID in the tooltip title
+                                    if (context.length > 0) {
+                                        return `Номер у черзі: ${context[0].parsed.y}`;
+                                    }
+                                    return '';
+                                },
+                                label: function(context) {
+                                    // Custom tooltip formatting if needed
+                                    if (context.dataset.label === 'Історичні дані' || context.dataset.label === 'Попередньо записані') {
+                                        return `ID: ${context.raw.y}, Дата: ${context.raw.x.toISOString().split('T')[0]}`;
+                                    }
+                                    // Use YYYY-MM-DD format
+                                    return `${context.dataset.label}: ${context.raw.x.toISOString().split('T')[0]}`;
+                                }
+                            }
+                        },
+                        freezeTooltip: true // Activate our custom plugin
+                    },
+                    interaction: {
+                        mode: 'nearest',
+                        axis: 'y',
+                        intersect: false
+                    }
+                },
+                plugins: [freezePlugin]
+            });
+        }
+    </script>
+</body>
+</html>
