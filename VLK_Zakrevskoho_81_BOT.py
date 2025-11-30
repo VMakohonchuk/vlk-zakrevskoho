@@ -484,6 +484,29 @@ def get_ua_weekday(date_obj):
     weekdays = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Нд']
     return weekdays[date_obj.weekday()]
 
+def get_ua_month(date_obj):
+    months = ['січ', 'лют', 'бер', 'кві', 'тра', 'чер', 'лип', 'сер', 'вер', 'жов', 'лис', 'гру']
+    return months[date_obj.month - 1]
+
+def calculate_date_probability(date_obj, dist):
+    """
+    Calculates the cumulative probability that the turn arrives by the end of the given date.
+    Returns the probability as a percentage (0-100).
+    """
+    try:
+        ordinal = get_ordinal_date(date_obj)
+        loc = dist['loc']
+        scale = dist['scale']
+        df = dist['df']
+        # Calculate cumulative probability for this ordinal (end of day)
+        # Using ordinal + 1 because ordinal represents the start of the day (or the whole day index),
+        # and we want the probability that the turn arrives BY the end of this day.
+        prob = stats.t.cdf(ordinal + 1, df, loc=loc, scale=scale)
+        return prob * 100
+    except Exception as e:
+        logger.error(f"Error calculating probability for {date_obj}: {e}")
+        return 0.0
+
 def date_keyboard(today = datetime.date.today(), days_to_check = 0, days_ahead = 15, start_date=None, end_date=None, prediction_dist=None) -> object:
     # Генеруємо кнопки тільки для робочих днів
     flat_keyboard_buttons = []
@@ -500,28 +523,15 @@ def date_keyboard(today = datetime.date.today(), days_to_check = 0, days_ahead =
         # Генеруємо всі робочі дні в діапазоні
         while iter_date <= limit_date:
              if iter_date.weekday() < 5:
-                 # Формуємо текст: "Пн 25.12.2025"
-                 date_str = iter_date.strftime("%d.%m.%Y")
+                 # Формуємо текст: "Пн 25.12" (день тижня, DD.MM)
+                 date_str = iter_date.strftime("%d.%m")
                  weekday_str = get_ua_weekday(iter_date)
                  button_text = f"{weekday_str} {date_str}"
                  
                  if prediction_dist:
-                     try:
-                         ordinal = get_ordinal_date(iter_date)
-                         loc = prediction_dist['loc']
-                         scale = prediction_dist['scale']
-                         df = prediction_dist['df']
-                         # Calculate cumulative probability for this ordinal (end of day)
-                         # Using ordinal + 1 because ordinal represents the start of the day (or the whole day index),
-                         # and we want the probability that the turn arrives BY the end of this day.
-                         prob = stats.t.cdf(ordinal + 1, df, loc=loc, scale=scale)
-                         percent = prob * 100
-                         if percent >= 0.1:
-                             emoji = "🔴" if percent < 50 else "🟢"
-                             # Додаємо емодзі на початок: "🔴 Пн 25.12.2025 (45%)"
-                             button_text = f"{emoji} {button_text} ({percent:.0f}%)"
-                     except Exception as e:
-                         logger.error(f"Error calculating probability: {e}")
+                     percent = calculate_date_probability(iter_date, prediction_dist)
+                     if percent >= 0.1:
+                         button_text = f"{button_text} {percent:.0f}%"
 
                  flat_keyboard_buttons.append(KeyboardButton(button_text))
              iter_date += datetime.timedelta(days=1)
@@ -533,9 +543,10 @@ def date_keyboard(today = datetime.date.today(), days_to_check = 0, days_ahead =
         iter_date = current_check_date
         while buttons_added < days_ahead:
             if iter_date.weekday() < 5: # Якщо це не субота (5) і не неділя (6)
-                date_str = iter_date.strftime("%d.%m.%Y")
+                date_str = iter_date.strftime("%d.%m")
                 weekday_str = get_ua_weekday(iter_date)
-                flat_keyboard_buttons.append(KeyboardButton(f"{weekday_str} {date_str}"))
+                button_text = f"{weekday_str} {date_str}"
+                flat_keyboard_buttons.append(KeyboardButton(button_text))
                 buttons_added += 1
             iter_date += datetime.timedelta(days=1)
     
@@ -1229,24 +1240,30 @@ async def join_get_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
             
             # Calculate probabilities for range bounds
             try:
-                l50_ord = get_ordinal_date(prediction['l50'])
-                h90_ord = get_ordinal_date(prediction['h90'])
+                # Determine the actual start date (taking into account 'tomorrow' and weekends)
+                start_date_candidate = prediction['mean']
+                min_date = today + datetime.timedelta(days=1)
                 
-                prob_l50 = stats.t.cdf(l50_ord + 1, dist['df'], loc=dist['loc'], scale=dist['scale']) * 100
-                prob_h90 = stats.t.cdf(h90_ord + 1, dist['df'], loc=dist['loc'], scale=dist['scale']) * 100
+                actual_start_date = max(start_date_candidate, min_date)
                 
-                range_info = f"`{prediction['l50'].strftime('%d.%m.%Y')}` ({prob_l50:.0f}%) - `{prediction['h90'].strftime('%d.%m.%Y')}` ({prob_h90:.0f}%)"
+                # Move to next working day if needed
+                while actual_start_date.weekday() >= 5:
+                     actual_start_date += datetime.timedelta(days=1)
+                
+                prob_start = calculate_date_probability(actual_start_date, dist)
+                prob_h90 = calculate_date_probability(prediction['h90'], dist)
+                
+                range_info = f"`{actual_start_date.strftime('%d.%m.%Y')}` ({prob_start:.0f}%) - `{prediction['h90'].strftime('%d.%m.%Y')}` ({prob_h90:.0f}%)"
             except Exception as e:
                 logger.error(f"Error calculating range probabilities: {e}")
-                range_info = f"`{prediction['l50'].strftime('%d.%m.%Y')}` - `{prediction['h90'].strftime('%d.%m.%Y')}`"
+                range_info = f"`{prediction['mean'].strftime('%d.%m.%Y')}` - `{prediction['h90'].strftime('%d.%m.%Y')}`"
 
-            # Відображаємо діапазон 25% - 95%
-            DATE_KEYBOARD = date_keyboard(today, 1, days_ahead, start_date=prediction['l50'], end_date=prediction['h90'], prediction_dist=prediction.get('dist'))
+            # Відображаємо діапазон 50% - 95%
+            DATE_KEYBOARD = date_keyboard(today, 1, days_ahead, start_date=actual_start_date, end_date=prediction['h90'], prediction_dist=prediction.get('dist'))
             
             # Додаємо інформацію до повідомлення
             prediction_text = (
-                f"{range_info}\n"
-                "Відсотки означають ймовірність того, що ваша черга настане до цієї дати."
+                f"{range_info}. *Відсоток означає ймовірність того, що ви зможете почати ВЛК в цей день.*"
             )
         else:
             context.user_data.pop('prediction_bounds', None)
@@ -1257,9 +1274,8 @@ async def join_get_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         
         await update.message.reply_text(
             f"{'УВАГА: '+user_warning if user_warning != '' else ''}"
-            f"Введіть бажану дату запису у форматі `ДД.ММ.РРРР`.\n"
-            f"Дата повинна бути пізнішою за поточну (`{today.strftime('%d.%m.%Y')}`) та бути робочим днем (Понеділок - П'ятниця).\n"
-            f"Ви можете ввести дату з клавіатури або обрати зі списку рекомендованих дат: {prediction_text}",
+            f"Виберіть бажану дату запису. Ви можете обрати одну з рекомендованих дат: {prediction_text}\n\n"
+            f"Або введіть дату з клавіатури. Дата повинна бути в форматі `ДД.ММ.РРРР`, пізнішою за поточну (`{today.strftime('%d.%m.%Y')}`) та бути робочим днем (Понеділок - П'ятниця).",
             parse_mode='Markdown',
             reply_markup=DATE_KEYBOARD # Використовуємо клавіатуру для дати
         )
@@ -1277,145 +1293,44 @@ async def join_get_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     """Отримує дату від користувача, перевіряє її, оновлює або додає запис."""
     global queue_df
     date_input = update.message.text.strip()
-    # Використовуємо regex для пошуку дати, ігноруючи емодзі та відсотки
-    match = re.search(r'\d{2}\.\d{2}\.\d{4}', date_input)
-    if match:
-        date_text = match.group(0)
-    else:
-        date_text = date_input.split()[0]
+    
     user_id = context.user_data.get('temp_id')
     previous_state = context.user_data.get('previous_state', '') # Отримуємо попередній стан
     user_notes = context.user_data.get('user_notes', '') # Отримуємо примітки
     telegram_user_data = context.user_data.get('telegram_user_data') # Отримуємо дані користувача
 
+    # Використовуємо regex для пошуку дати, ігноруючи емодзі та відсотки
+    # Оновлений regex для підтримки формату без року (або з роком) на кнопках, але користувач може ввести повну дату
+    # Пріоритет: спочатку шукаємо повну дату dd.mm.yyyy, потім dd/mm
+    
+    match_full = re.search(r'(\d{2})\.(\d{2})\.(\d{4})', date_input)
+    
     try:
-        # Парсимо дату
-        chosen_date = datetime.datetime.strptime(date_text, "%d.%m.%Y").date()
-        current_date_obj = datetime.date.today()
-
-        # Перевірка, чи дата поточна або пізніша 
-        if chosen_date <= current_date_obj:
-            logger.warning(f"Користувач {get_user_log_info(update.effective_user)} ввів дату раніше ніж наступний робочий день: '{date_input}'")
-            DATE_KEYBOARD=date_keyboard(current_date_obj, 1, days_ahead)
-            await update.message.reply_text(
-                f"Дата повинна бути пізнішою за поточну (`{current_date_obj.strftime('%d.%m.%Y')}`). Будь ласка, спробуйте ще раз або скасуйте дію.",
-                parse_mode='Markdown',
-                reply_markup=DATE_KEYBOARD
-            )
-            return JOIN_GETTING_DATE
-        
-        # ПЕРЕВІРКА: чи є обрана дата вихідним днем (субота або неділя)
-        if chosen_date.weekday() >= 5: # 5 - субота, 6 - неділя
-            logger.warning(f"Користувач {get_user_log_info(update.effective_user)} ввів вихідний день: '{date_input}'")
-            DATE_KEYBOARD=date_keyboard(current_date_obj, 1, days_ahead)
-            await update.message.reply_html(
-                "Ви обрали вихідний день (Субота або Неділя). Будь ласка, оберіть <code>робочий день</code> (Понеділок - П'ятниця) або скасуйте дію.",
-                reply_markup=DATE_KEYBOARD
-            )
-            return JOIN_GETTING_DATE # Залишаємося в тому ж стані
-
-        # ПЕРЕВІРКА: чи дата співпадає з поточною датою запису
-        if date_input == previous_state:
-            logger.warning(f"Користувач {get_user_log_info(update.effective_user)} ввів дату, що співпадає з попереднім записом: '{date_input}'")
-            DATE_KEYBOARD=date_keyboard(current_date_obj, 1, days_ahead)
-            await update.message.reply_text(
-                f"Дата не повинна співпадати з поточною датою запису (`{chosen_date.strftime('%d.%m.%Y')}`). Будь ласка, оберіть іншу дату або скасуйте дію.",
-                parse_mode='Markdown',
-                reply_markup=DATE_KEYBOARD
-            )
-            return JOIN_GETTING_DATE # Залишаємося в тому ж стані        
-
-        # --- ЛОГІКА ПОПЕРЕДЖЕНЬ ---
-        prediction = context.user_data.get('prediction_bounds')
-        warning_shown = context.user_data.get('warning_shown', False)
-        warned_date_str = context.user_data.get('warned_date')
-
-        if prediction:
-            # Check if this is a re-confirmation of the SAME warned date
-            if warning_shown and warned_date_str and warned_date_str == chosen_date.strftime("%d.%m.%Y"):
-                 # User confirmed the warning by re-entering the same date
-                 pass 
-            else:
-                 # Evaluate warning for the new date (or if warning wasn't shown yet)
-                warn_msg = None
-                
-                # Calculate probability for chosen date
-                try:
-                    dist = prediction['dist']
-                    chosen_ord = get_ordinal_date(chosen_date)
-                    chosen_prob = stats.t.cdf(chosen_ord + 1, dist['df'], loc=dist['loc'], scale=dist['scale']) * 100
-                except Exception as e:
-                    logger.error(f"Error calculating chosen date probability: {e}")
-                    chosen_prob = 0
-                    
-                if chosen_date < prediction['l50']:
-                    warn_msg = (
-                        f"⚠️ **Попередження:** Для обраної дати `{chosen_date.strftime('%d.%m.%Y')}` ви маєте **низьку ймовірність** успішно записатися на ВЛК ({chosen_prob:.1f}%).\n"
-                        f"Рекомендовано обирати дату з інтервалу `{prediction['l50'].strftime('%d.%m.%Y')}` - `{prediction['h50'].strftime('%d.%m.%Y')}`."
-                    )
-                elif chosen_date > prediction['h90']:
-                    try:
-                        h90_ord = get_ordinal_date(prediction['h90'])
-                        h90_prob = stats.t.cdf(h90_ord + 1, dist['df'], loc=dist['loc'], scale=dist['scale']) * 100
-                        h90_prob_str = f" ({h90_prob:.1f}%)"
-                    except Exception as e:
-                         h90_prob_str = ""
-
-                    warn_msg = (
-                        f"⚠️ **Попередження:** Обрана дата `{chosen_date.strftime('%d.%m.%Y')}` занадто далеко в майбутньому ({chosen_prob:.1f}%). Вам не треба так довго чекати, шанс успішно записатися на ВЛК майже гарантований > 95%.\n"
-                        f"Ви можете спробувати записатися на ранішу дату (до `{prediction['h90'].strftime('%d.%m.%Y')}`{h90_prob_str})."
-                    )
-                    
-                if warn_msg:
-                    context.user_data['warning_shown'] = True
-                    context.user_data['warned_date'] = chosen_date.strftime("%d.%m.%Y")
-                    
-                    today = datetime.date.today()
-                    DATE_KEYBOARD = date_keyboard(today, 1, days_ahead, start_date=prediction['l50'], end_date=prediction['h90'], prediction_dist=prediction.get('dist'))
-                    
-                    await update.message.reply_text(
-                        f"{warn_msg}\n\nЯкщо ви бажаєте залишити цю дату, введіть її ще раз або натисніть кнопку щоб обрати одну з рекомендованих.",
-                        parse_mode='Markdown',
-                        reply_markup=DATE_KEYBOARD
-                    )
-                    return JOIN_GETTING_DATE
-                else:
-                    # Clear warning state if date is good
-                    context.user_data.pop('warning_shown', None)
-                    context.user_data.pop('warned_date', None)
-
-        # Створення нового рядка для додавання в DataFrame
-        new_entry = {
-            'ID': user_id,
-            'Дата': chosen_date.strftime("%d.%m.%Y"),
-            'Примітки': user_notes,
-            'Статус': 'На розгляді', # Додаємо статус "На розгляді"
-            'Змінено': datetime.datetime.now().strftime("%d.%m.%Y %H:%M:%S"),
-            'Попередня дата': previous_state, # Використовуємо збережений попередній стан
-            **telegram_user_data # Розпаковуємо дані користувача Telegram
-        }
-        
-        new_entry_df = pd.DataFrame([new_entry])
-        # Спроба зберегти дані
-        if save_queue_data(new_entry_df): # Перевіряємо результат збереження
-            # Оновлюємо глобальний DataFrame ТІЛЬКИ ПІСЛЯ УСПІШНОГО ЗБЕРЕЖЕННЯ
-            queue_df = pd.concat([queue_df, new_entry_df], ignore_index=True)
-            notification_text = f"✅ Користувач {update.effective_user.mention_html()} створив запис для\nID <code>{user_id}</code> на <code>{chosen_date.strftime('%d.%m.%Y')}</code>" 
-            #await send_group_notification(context, notification_text)
-            message_text = f"Ви успішно створили заявку на запис/перенос дати в черзі!\nВаш ID: `{user_id}`, Обрана дата: `{chosen_date.strftime('%d.%m.%Y')}`\nСтатус заявки: `На розгляді`\nВаша заявка на розгляді у адміністраторів.\nЯкщо вона буде \"Ухвалена\", то через деякий час з'явиться в жовтій таблиці 🟡TODO."
-            await update.message.reply_text(message_text, parse_mode='Markdown', reply_markup=MAIN_KEYBOARD)
-            logger.info(f"Запис користувача {get_user_log_info(update.effective_user)} (ID: {user_id}) оновлено/додано на дату: {chosen_date.strftime('%d.%m.%Y')}. Попередня дата: {previous_state if previous_state else 'новий запис'}")
-            context.user_data.clear()
-            return ConversationHandler.END
+        if match_full:
+            date_text = match_full.group(0)
+            chosen_date = datetime.datetime.strptime(date_text, "%d.%m.%Y").date()
         else:
-            # Якщо збереження не вдалося
-            logger.error(f"Не вдалося зберегти запис користувача {get_user_log_info(update.effective_user)} (ID: {user_id}) на дату: {chosen_date.strftime('%d.%m.%Y')}.")
-            await update.message.reply_text(
-                "Сталася технічна помилка при збереженні вашого запису. Будь ласка, спробуйте повторити спробу пізніше.",
-                reply_markup=MAIN_KEYBOARD
-            )
-            context.user_data.clear() # Завершуємо розмову, щоб користувач міг почати знову
-            return ConversationHandler.END
+            # Спроба розпарсити формат з кнопки: "Вт 20.01 51%" -> шукаємо DD.MM
+            match_short = re.search(r'(\d{1,2})\.(\d{1,2})', date_input)
+            if match_short:
+                day = int(match_short.group(1))
+                month = int(match_short.group(2))
+                
+                # Визначаємо рік. Якщо місяць менший за поточний, це наступний рік
+                # Але треба бути обережним, якщо поточний місяць грудень, а кнопка січень
+                current_today = datetime.date.today()
+                year = current_today.year
+                
+                # Проста евристика: якщо дата вже минула в цьому році, то це наступний рік
+                candidate_date = datetime.date(year, month, day)
+                if candidate_date < current_today:
+                    year += 1
+                    
+                chosen_date = datetime.date(year, month, day)
+            else:
+                 # Fallback: пробуємо просто перше слово, якщо це не спрацювало раніше
+                 date_text = date_input.split()[0]
+                 chosen_date = datetime.datetime.strptime(date_text, "%d.%m.%Y").date()
 
     except ValueError:
         logger.warning(f"Користувач {get_user_log_info(update.effective_user)} ввів некоректний формат дати: '{date_input}'")
@@ -1426,6 +1341,148 @@ async def join_get_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             reply_markup=DATE_KEYBOARD
         )
         return JOIN_GETTING_DATE # Залишаємося в тому ж стані
+
+    current_date_obj = datetime.date.today()
+
+    # Перевірка, чи дата поточна або пізніша 
+    if chosen_date <= current_date_obj:
+        logger.warning(f"Користувач {get_user_log_info(update.effective_user)} ввів дату раніше ніж наступний робочий день: '{date_input}'")
+        DATE_KEYBOARD=date_keyboard(current_date_obj, 1, days_ahead)
+        await update.message.reply_text(
+            f"Дата повинна бути пізнішою за поточну (`{current_date_obj.strftime('%d.%m.%Y')}`). Будь ласка, спробуйте ще раз або скасуйте дію.",
+            parse_mode='Markdown',
+            reply_markup=DATE_KEYBOARD
+        )
+        return JOIN_GETTING_DATE
+    
+    # ПЕРЕВІРКА: чи є обрана дата вихідним днем (субота або неділя)
+    if chosen_date.weekday() >= 5: # 5 - субота, 6 - неділя
+        logger.warning(f"Користувач {get_user_log_info(update.effective_user)} ввів вихідний день: '{date_input}'")
+        DATE_KEYBOARD=date_keyboard(current_date_obj, 1, days_ahead)
+        await update.message.reply_html(
+            "Ви обрали вихідний день (Субота або Неділя). Будь ласка, оберіть <code>робочий день</code> (Понеділок - П'ятниця) або скасуйте дію.",
+            reply_markup=DATE_KEYBOARD
+        )
+        return JOIN_GETTING_DATE # Залишаємося в тому ж стані
+
+    # ПЕРЕВІРКА: чи дата співпадає з поточною датою запису
+    if date_input == previous_state:
+        logger.warning(f"Користувач {get_user_log_info(update.effective_user)} ввів дату, що співпадає з попереднім записом: '{date_input}'")
+        DATE_KEYBOARD=date_keyboard(current_date_obj, 1, days_ahead)
+        await update.message.reply_text(
+            f"Дата не повинна співпадати з поточною датою запису (`{chosen_date.strftime('%d.%m.%Y')}`). Будь ласка, оберіть іншу дату або скасуйте дію.",
+            parse_mode='Markdown',
+            reply_markup=DATE_KEYBOARD
+        )
+        return JOIN_GETTING_DATE # Залишаємося в тому ж стані        
+
+    # --- ЛОГІКА ПОПЕРЕДЖЕНЬ ---
+    prediction = context.user_data.get('prediction_bounds')
+    warning_shown = context.user_data.get('warning_shown', False)
+    warned_date_str = context.user_data.get('warned_date')
+
+    if prediction:
+        # Check if this is a re-confirmation of the SAME warned date
+        if warning_shown and warned_date_str and warned_date_str == chosen_date.strftime("%d.%m.%Y"):
+                # User confirmed the warning by re-entering the same date
+                pass 
+        else:
+                # Evaluate warning for the new date (or if warning wasn't shown yet)
+            warn_msg = None
+            
+            # Calculate probability for chosen date
+            try:
+                dist = prediction['dist']
+                chosen_ord = get_ordinal_date(chosen_date)
+                chosen_prob = stats.t.cdf(chosen_ord + 1, dist['df'], loc=dist['loc'], scale=dist['scale']) * 100
+            except Exception as e:
+                logger.error(f"Error calculating chosen date probability: {e}")
+                chosen_prob = 0
+                
+            if chosen_date < prediction['mean']:
+                try:
+                    prob_mean = calculate_date_probability(prediction['mean'], dist)
+                    prob_h90 = calculate_date_probability(prediction['h90'], dist)
+                    
+                    range_info = f"`{prediction['mean'].strftime('%d.%m.%Y')}` ({prob_mean:.0f}%) - `{prediction['h90'].strftime('%d.%m.%Y')}` ({prob_h90:.0f}%)"
+                except Exception as e:
+                    logger.error(f"Error calculating range probabilities for warning: {e}")
+                    range_info = f"`{prediction['mean'].strftime('%d.%m.%Y')}` - `{prediction['h90'].strftime('%d.%m.%Y')}`"
+
+                warn_msg = (
+                    f"⚠️ *Попередження:* Для обраної дати `{chosen_date.strftime('%d.%m.%Y')}` ви маєте *низьку ймовірність* почати ВЛК ({chosen_prob:.1f}%).\n"
+                    f"Рекомендовано обирати дату з інтервалу {range_info}."
+                )
+            elif chosen_date > prediction['h90']:
+                try:
+                    h90_prob = calculate_date_probability(prediction['h90'], dist)
+                    h90_prob_str = f"{h90_prob:.1f}%"
+                except Exception as e:
+                        h90_prob_str = ""
+
+                warn_msg = (
+                    f"⚠️ *Попередження:* Обрана дата `{chosen_date.strftime('%d.%m.%Y')}` *занадто далеко в майбутньому*. "
+                    f"Вам не треба так довго чекати, шанс успішно почати ВЛК майже гарантований для ближчих дат (наприклад {h90_prob_str} для `{prediction['h90'].strftime('%d.%m.%Y')}`)."
+                )
+                
+            if warn_msg:
+                context.user_data['warning_shown'] = True
+                context.user_data['warned_date'] = chosen_date.strftime("%d.%m.%Y")
+                
+                today = datetime.date.today()
+                
+                # Determine the actual start date for the recommended range (max of mean prediction or tomorrow)
+                start_date_candidate = prediction['mean']
+                min_date = today + datetime.timedelta(days=1)
+                actual_start_date = max(start_date_candidate, min_date)
+                while actual_start_date.weekday() >= 5:
+                        actual_start_date += datetime.timedelta(days=1)
+
+                DATE_KEYBOARD = date_keyboard(today, 1, days_ahead, start_date=actual_start_date, end_date=prediction['h90'], prediction_dist=prediction.get('dist'))
+                
+                await update.message.reply_text(
+                    f"{warn_msg}\n\nЯкщо ви бажаєте залишити цю дату, введіть її ще раз або натисніть кнопку щоб обрати одну з рекомендованих.",
+                    parse_mode='Markdown',
+                    reply_markup=DATE_KEYBOARD
+                )
+                return JOIN_GETTING_DATE
+            else:
+                # Clear warning state if date is good
+                context.user_data.pop('warning_shown', None)
+                context.user_data.pop('warned_date', None)
+
+    # Створення нового рядка для додавання в DataFrame
+    new_entry = {
+        'ID': user_id,
+        'Дата': chosen_date.strftime("%d.%m.%Y"),
+        'Примітки': user_notes,
+        'Статус': 'На розгляді', # Додаємо статус "На розгляді"
+        'Змінено': datetime.datetime.now().strftime("%d.%m.%Y %H:%M:%S"),
+        'Попередня дата': previous_state, # Використовуємо збережений попередній стан
+        **telegram_user_data # Розпаковуємо дані користувача Telegram
+    }
+    
+    new_entry_df = pd.DataFrame([new_entry])
+    # Спроба зберегти дані
+    if save_queue_data(new_entry_df): # Перевіряємо результат збереження
+        # Оновлюємо глобальний DataFrame ТІЛЬКИ ПІСЛЯ УСПІШНОГО ЗБЕРЕЖЕННЯ
+        queue_df = pd.concat([queue_df, new_entry_df], ignore_index=True)
+        notification_text = f"✅ Користувач {update.effective_user.mention_html()} створив запис для\nID <code>{user_id}</code> на <code>{chosen_date.strftime('%d.%m.%Y')}</code>" 
+        #await send_group_notification(context, notification_text)
+        message_text = f"Ви успішно створили заявку на запис/перенос дати в черзі!\nВаш ID: `{user_id}`, Обрана дата: `{chosen_date.strftime('%d.%m.%Y')}`\nСтатус заявки: `На розгляді`\nВаша заявка на розгляді у адміністраторів.\nЯкщо вона буде \"Ухвалена\", то через деякий час з'явиться в жовтій таблиці 🟡TODO."
+        await update.message.reply_text(message_text, parse_mode='Markdown', reply_markup=MAIN_KEYBOARD)
+        logger.info(f"Запис користувача {get_user_log_info(update.effective_user)} (ID: {user_id}) оновлено/додано на дату: {chosen_date.strftime('%d.%m.%Y')}. Попередня дата: {previous_state if previous_state else 'новий запис'}")
+        context.user_data.clear()
+        return ConversationHandler.END
+    else:
+        # Якщо збереження не вдалося
+        logger.error(f"Не вдалося зберегти запис користувача {get_user_log_info(update.effective_user)} (ID: {user_id}) на дату: {chosen_date.strftime('%d.%m.%Y')}.")
+        await update.message.reply_text(
+            "Сталася технічна помилка при збереженні вашого запису. Будь ласка, спробуйте повторити спробу пізніше.",
+            reply_markup=MAIN_KEYBOARD
+        )
+        context.user_data.clear() # Завершуємо розмову, щоб користувач міг почати знову
+        return ConversationHandler.END
 
 # --- ФУНКЦІЇ ДЛЯ РОЗМОВИ СКАСУВАННЯ ЗАПИСУ (/cancel_record) ---
 
