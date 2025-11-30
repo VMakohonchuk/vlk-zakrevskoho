@@ -32,18 +32,29 @@
     </div>
     
     <div style="margin-top: 10px; font-style: italic; color: #666; font-size: 0.9em;">
-        Примітка: Попередні записи на дати, що віддалені більш ніж на 3 місяці від останньої історичної дати, на графіку не відображаються.
+        Примітка: Попередні записи на дати, що віддалені більш ніж на 3 місяці від поточної дати, на графіку не відображаються.
     </div>
 
     <script>
         // Google Sheet CSV URL
         const SHEET_ID = '1d9OG-0b7wxxqrOujC9v6ikhjMKL2ei3wfrfaG61zSjA';
         const GID = '822507513';
-        const MAX_ID_GID = '84071606'; // Sheet to find max ID
+        const HISTORICAL_DATA_GID = '84071606';
         
-        // Use a CORS proxy to handle redirects and CORS headers
-        const CSV_URL = 'https://corsproxy.io/?' + encodeURIComponent(`https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&gid=${GID}`);
-        const MAX_ID_URL = 'https://corsproxy.io/?' + encodeURIComponent(`https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&gid=${MAX_ID_GID}`);
+        const rawCsvUrl = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&gid=${GID}`;
+        const rawMaxIdUrl = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&gid=${HISTORICAL_DATA_GID}`;
+
+        const isLocalhost = window.location.hostname === 'localhost' || 
+                            window.location.hostname === '127.0.0.1' ||
+                            window.location.protocol === 'file:';
+
+        // Use a CORS proxy to handle redirects and CORS headers only for localhost or local file access
+        const CSV_URL = isLocalhost 
+            ? 'https://corsproxy.io/?' + encodeURIComponent(rawCsvUrl) 
+            : rawCsvUrl;
+        const MAX_ID_URL = isLocalhost 
+            ? 'https://corsproxy.io/?' + encodeURIComponent(rawMaxIdUrl) 
+            : rawMaxIdUrl;
 
         // --- Helper Functions ---
 
@@ -285,9 +296,11 @@
             const mseWeighted = weightedSumResSq / degreesOfFreedom;
 
             // T-scores
-            // 95% confidence -> alpha=0.05, two-tailed -> 0.975
-            const tScore95 = jStat.studentt.inv(0.975, degreesOfFreedom);
-            // 50% confidence -> alpha=0.50, two-tailed -> 0.75
+            // For "5% Chance" and "95% Chance" labels, we need the 5th and 95th percentiles.
+            // This corresponds to a 90% Confidence Interval (alpha=0.10, two-tailed -> 0.05 in each tail).
+            // inv(0.95) gives the 95th percentile.
+            const tScore90 = jStat.studentt.inv(0.95, degreesOfFreedom);
+            // 50% confidence -> alpha=0.50, two-tailed -> 0.75 (75th percentile)
             const tScore50 = jStat.studentt.inv(0.75, degreesOfFreedom);
 
             // 5. Generate Prediction Data Points
@@ -309,32 +322,32 @@
                 const term3 = Math.pow(qId - weightedMeanX, 2) / weightedVarX;
                 const sePred = Math.sqrt(mseWeighted * (1 + 1/sumW + term3));
 
-                const margin95 = tScore95 * sePred;
+                const margin90 = tScore90 * sePred;
                 const margin50 = tScore50 * sePred;
 
-                let l95 = predOrd - margin95;
-                let h95 = predOrd + margin95;
+                let l90 = predOrd - margin90;
+                let h90 = predOrd + margin90;
                 let l50 = predOrd - margin50;
                 let h50 = predOrd + margin50;
 
                 // Logic Clamp: Future predictions cannot be in the past
                 if (qId > maxId) {
                     if (predOrd < minFeasibleOrdinal) predOrd = minFeasibleOrdinal;
-                    if (l95 < minFeasibleOrdinal) l95 = minFeasibleOrdinal;
+                    if (l90 < minFeasibleOrdinal) l90 = minFeasibleOrdinal;
                     if (l50 < minFeasibleOrdinal) l50 = minFeasibleOrdinal;
                 }
 
                 // Sort bounds
-                if (l95 > predOrd) l95 = predOrd;
-                if (h95 < predOrd) h95 = predOrd;
+                if (l90 > predOrd) l90 = predOrd;
+                if (h90 < predOrd) h90 = predOrd;
                 if (l50 > predOrd) l50 = predOrd;
                 if (h50 < predOrd) h50 = predOrd;
 
                 predPoints.push({
                     id: qId,
                     mean: fromOrdinal(predOrd),
-                    l95: fromOrdinal(l95),
-                    h95: fromOrdinal(h95),
+                    l90: fromOrdinal(l90), // 5th percentile
+                    h90: fromOrdinal(h90), // 95th percentile
                     l50: fromOrdinal(l50),
                     h50: fromOrdinal(h50)
                 });
@@ -361,15 +374,15 @@
             // Confidence Intervals
             // We filter them to ensure they don't show "past" predictions
             
-            const l95Data = filterFuture(predPoints.map(p => ({ x: p.l95, y: p.id })));
-            const h95Data = filterFuture(predPoints.map(p => ({ x: p.h95, y: p.id })));
+            const l90Data = filterFuture(predPoints.map(p => ({ x: p.l90, y: p.id })));
+            const h90Data = filterFuture(predPoints.map(p => ({ x: p.h90, y: p.id })));
             const l50Data = filterFuture(predPoints.map(p => ({ x: p.l50, y: p.id })));
             const h50Data = filterFuture(predPoints.map(p => ({ x: p.h50, y: p.id })));
 
-            renderChart(histData, preBookedChartData, meanData, l95Data, h95Data, l50Data, h50Data);
+            renderChart(histData, preBookedChartData, meanData, l90Data, h90Data, l50Data, h50Data);
         }
 
-        function renderChart(histData, preBookedData, meanData, l95Data, h95Data, l50Data, h50Data) {
+        function renderChart(histData, preBookedData, meanData, l90Data, h90Data, l50Data, h50Data) {
             const ctx = document.getElementById('queueChart').getContext('2d');
             
             // Helper to freeze chart at a specific ID
@@ -408,8 +421,8 @@
                     chart.frozenData = {
                         id: nearest.y,
                         mean: nearest.x,
-                        l95: l95Data[idx].x,
-                        h95: h95Data[idx].x,
+                        l90: l90Data[idx].x,
+                        h90: h90Data[idx].x,
                         l50: l50Data[idx].x,
                         h50: h50Data[idx].x,
                         actualDate: actualDate,
@@ -516,11 +529,11 @@
                         
                         const textLines = [
                             `Номер у черзі: ${data.id}`,
-                            `5% шансу: ${formatDate(data.l95)}`,
+                            `5% шансу: ${formatDate(data.l90)}`,
                             `25% шансу: ${formatDate(data.l50)}`,
                             `50% шансу: ${formatDate(data.mean)}`,
                             `75% шансу: ${formatDate(data.h50)}`,
-                            `95% шансу: ${formatDate(data.h95)}`
+                            `95% шансу: ${formatDate(data.h90)}`
                         ];
                         
                         // Add actual date info if available
@@ -609,7 +622,7 @@
                         },
                         {
                             label: '95% Шанс',
-                            data: h95Data,
+                            data: h90Data,
                             borderColor: 'rgb(0, 255, 0)', // Bright Green
                             borderWidth: 2,
                             showLine: true,
@@ -641,7 +654,7 @@
                         },
                         {
                             label: '5% Шанс',
-                            data: l95Data,
+                            data: l90Data,
                             borderColor: 'red', // Red
                             borderWidth: 2,
                             showLine: true,
