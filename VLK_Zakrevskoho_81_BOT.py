@@ -26,6 +26,8 @@ from apscheduler.triggers.cron import CronTrigger
 import asyncio # Якщо ви ще не імпортували для асинхронності
 import signal # Імпортуємо модуль signal
 from pytz import timezone # pip install pytz
+import numpy as np
+from scipy import stats
 
 DEBUG = False
 is_bot_in_group = True
@@ -125,6 +127,115 @@ STATUS_GETTING_ID = range(5, 6) # Новий стан для запиту ID
 REQUIRED_COLUMNS = ['ID', 'Дата', 'Примітки', 'Статус', 'Змінено', 'Попередня дата', 'TG ID', 'TG Name', 'TG Full Name']
 days_ahead = 15 # Кількість кнопок днів, які ми хочемо показати
 
+
+# --- ДОПОМІЖНІ ФУНКЦІЇ ДЛЯ ПРОГНОЗУВАННЯ ---
+def get_ordinal_date(date_obj):
+    # Якірна дата: 5 січня 1970 року (понеділок)
+    anchor = datetime.date(1970, 1, 5)
+    diff = (date_obj - anchor).days
+    weeks = diff // 7
+    days = diff % 7
+    return weeks * 5 + min(days, 5)
+
+def get_date_from_ordinal(ordinal):
+    anchor = datetime.date(1970, 1, 5)
+    weeks = int(ordinal) // 5
+    days = int(ordinal) % 5
+    total_days = weeks * 7 + days
+    return anchor + datetime.timedelta(days=total_days)
+
+def calculate_prediction(user_id, stats_df):
+    if stats_df is None or stats_df.empty:
+        return None
+        
+    df = stats_df.copy()
+    # Перетворення в числовий формат та формат дати
+    df['id'] = pd.to_numeric(df['Останній номер що зайшов'], errors='coerce')
+    df['date'] = pd.to_datetime(df['Дата прийому'], format='%d.%m.%Y', dayfirst=True, errors='coerce').dt.date
+    df = df.dropna(subset=['id', 'date'])
+    
+    if len(df) < 5: # Потрібна достатня кількість точок
+        return None
+
+    df['ordinal'] = df['date'].apply(get_ordinal_date)
+    df = df.sort_values('ordinal')
+    
+    X = df['id'].values
+    Y = df['ordinal'].values
+    n = len(X)
+    
+    # Експоненційні ваги
+    weights = np.exp(-3 + (np.arange(n) / (n - 1)) * 3)
+    
+    sumW = np.sum(weights)
+    sumWX = np.sum(weights * X)
+    sumWY = np.sum(weights * Y)
+    # зважена лінійна регресія
+    sumWXX = np.sum(weights * X**2)
+    sumWXY = np.sum(weights * X * Y)
+    
+    denom = sumW * sumWXX - sumWX**2
+    if denom == 0:
+        return None
+        
+    slope = (sumW * sumWXY - sumWX * sumWY) / denom
+    intercept = (sumWY - slope * sumWX) / sumW
+    
+    # Статистика для інтервалів
+    weightedMeanX = sumWX / sumW
+    # Зважена дисперсія X
+    weightedVarX = np.sum(weights * (X - weightedMeanX)**2)
+    
+    yPred = slope * X + intercept
+    residuals = Y - yPred
+    weightedSumResSq = np.sum(weights * residuals**2)
+    
+    dof = sumW - 2
+    if dof <= 0:
+        return None
+        
+    mseWeighted = weightedSumResSq / dof
+    
+    # T-показники
+    tScore90 = stats.t.ppf(0.95, dof)
+    tScore50 = stats.t.ppf(0.75, dof)
+    
+    predOrd = slope * user_id + intercept
+    
+    term3 = (user_id - weightedMeanX)**2 / weightedVarX
+    sePred = np.sqrt(mseWeighted * (1 + 1/sumW + term3))
+    
+    margin90 = tScore90 * sePred
+    margin50 = tScore50 * sePred
+    
+    # Межі
+    l90_ord = predOrd - margin90
+    h90_ord = predOrd + margin90
+    l50_ord = predOrd - margin50
+    h50_ord = predOrd + margin50
+    
+    # Обмеження майбутнім (наступний робочий день після останньої історичної дати)
+    max_hist_ord = df['ordinal'].max()
+    min_feasible = max_hist_ord + 1
+    
+    # Обмежуємо нижню межу, тільки якщо ID в майбутньому (більше максимального історичного ID)
+    if user_id > df['id'].max():
+        l90_ord = max(l90_ord, min_feasible)
+        l50_ord = max(l50_ord, min_feasible)
+        # Перевірка валідності початку діапазону
+    
+    return {
+        'l90': get_date_from_ordinal(l90_ord),
+        'l50': get_date_from_ordinal(l50_ord),
+        'mean': get_date_from_ordinal(predOrd),
+        'h50': get_date_from_ordinal(h50_ord),
+        'h90': get_date_from_ordinal(h90_ord),
+        'dist': {
+            'loc': predOrd,
+            'scale': sePred,
+            'df': dof
+        }
+    }
 
 # Завантаження даних з Google Sheet або створення нового DataFrame
 def load_queue_data() -> pd.DataFrame | None:
@@ -369,21 +480,64 @@ SHOW_OPTION_KEYBOARD = ReplyKeyboardMarkup([
         [KeyboardButton(BUTTON_TEXT_CANCEL_OP)]],
         one_time_keyboard=True, resize_keyboard=True)
 
-def date_keyboard(today = datetime.date.today(), days_to_check = 0, days_ahead = 15) -> object:
-    # Генеруємо кнопки тільки для робочих днів (наприклад, наступні 10 днів, але лише робочі)
-    # days_to_check = 0 # Починаємо з поточного // дня days_to_check = 1 # Починаємо з наступного дня
+def get_ua_weekday(date_obj):
+    weekdays = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Нд']
+    return weekdays[date_obj.weekday()]
+
+def date_keyboard(today = datetime.date.today(), days_to_check = 0, days_ahead = 15, start_date=None, end_date=None, prediction_dist=None) -> object:
+    # Генеруємо кнопки тільки для робочих днів
     flat_keyboard_buttons = []
     keyboard_buttons = []
-    buttons_added = 0
-    chunk_size = 3  # Кількість стопвців для кнопок днів, які ми хочемо улаштувати
+    chunk_size = 3 
     
-    while buttons_added < days_ahead: 
-        future_date = today + datetime.timedelta(days=days_to_check)
-        # weekday() повертає 0 для понеділка, 1 для вівторка, ..., 5 для суботи, 6 для неділі
-        if future_date.weekday() < 5: # Якщо це не субота (5) і не неділя (6)
-            flat_keyboard_buttons.append(KeyboardButton(future_date.strftime("%d.%m.%Y")))
-            buttons_added += 1
-        days_to_check += 1
+    current_check_date = today + datetime.timedelta(days=days_to_check)
+    
+    if start_date and end_date:
+        # Переконуємось, що start_date не раніше current_check_date
+        iter_date = max(current_check_date, start_date)
+        limit_date = end_date
+        
+        # Генеруємо всі робочі дні в діапазоні
+        while iter_date <= limit_date:
+             if iter_date.weekday() < 5:
+                 # Формуємо текст: "Пн 25.12.2025"
+                 date_str = iter_date.strftime("%d.%m.%Y")
+                 weekday_str = get_ua_weekday(iter_date)
+                 button_text = f"{weekday_str} {date_str}"
+                 
+                 if prediction_dist:
+                     try:
+                         ordinal = get_ordinal_date(iter_date)
+                         loc = prediction_dist['loc']
+                         scale = prediction_dist['scale']
+                         df = prediction_dist['df']
+                         # Calculate cumulative probability for this ordinal (end of day)
+                         # Using ordinal + 1 because ordinal represents the start of the day (or the whole day index),
+                         # and we want the probability that the turn arrives BY the end of this day.
+                         prob = stats.t.cdf(ordinal + 1, df, loc=loc, scale=scale)
+                         percent = prob * 100
+                         if percent >= 0.1:
+                             emoji = "🔴" if percent < 50 else "🟢"
+                             # Додаємо емодзі на початок: "🔴 Пн 25.12.2025 (45%)"
+                             button_text = f"{emoji} {button_text} ({percent:.0f}%)"
+                     except Exception as e:
+                         logger.error(f"Error calculating probability: {e}")
+
+                 flat_keyboard_buttons.append(KeyboardButton(button_text))
+             iter_date += datetime.timedelta(days=1)
+             # Запобіжник: перериваємо, якщо кнопок забагато
+             if len(flat_keyboard_buttons) >= 30:
+                 break
+    else:
+        buttons_added = 0
+        iter_date = current_check_date
+        while buttons_added < days_ahead:
+            if iter_date.weekday() < 5: # Якщо це не субота (5) і не неділя (6)
+                date_str = iter_date.strftime("%d.%m.%Y")
+                weekday_str = get_ua_weekday(iter_date)
+                flat_keyboard_buttons.append(KeyboardButton(f"{weekday_str} {date_str}"))
+                buttons_added += 1
+            iter_date += datetime.timedelta(days=1)
     
     # Додаємо кнопку "Скасувати ввід" до клавіатури вибору дати
     keyboard_buttons.append([KeyboardButton(BUTTON_TEXT_CANCEL_OP)])
@@ -1020,6 +1174,9 @@ async def join_get_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
     # Перевіряємо, чи ID вже існує
     context.user_data['temp_id'] = user_id_input
+    # Очищаємо попередній стан попереджень та прогнозів при введенні нового ID
+    context.user_data.pop('warning_shown', None)
+    context.user_data.pop('prediction_bounds', None)
     
     # Знаходимо останній актуальний запис для цього ID
     temp_df_for_prev = queue_df.copy()
@@ -1060,14 +1217,49 @@ async def join_get_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         user_warning = ''  
     if can_register:
         today = datetime.date.today()
-        DATE_KEYBOARD=date_keyboard(today, 1, days_ahead)
+        
+        # --- ЛОГІКА ПРОГНОЗУВАННЯ ---
+        stats_df = await get_stats_data()
+        prediction = calculate_prediction(extract_main_id(user_id_input), stats_df)
+        
+        prediction_text = ""
+        if prediction:
+            context.user_data['prediction_bounds'] = prediction
+            dist = prediction['dist']
+            
+            # Calculate probabilities for range bounds
+            try:
+                l50_ord = get_ordinal_date(prediction['l50'])
+                h90_ord = get_ordinal_date(prediction['h90'])
+                
+                prob_l50 = stats.t.cdf(l50_ord + 1, dist['df'], loc=dist['loc'], scale=dist['scale']) * 100
+                prob_h90 = stats.t.cdf(h90_ord + 1, dist['df'], loc=dist['loc'], scale=dist['scale']) * 100
+                
+                range_info = f"`{prediction['l50'].strftime('%d.%m.%Y')}` ({prob_l50:.0f}%) - `{prediction['h90'].strftime('%d.%m.%Y')}` ({prob_h90:.0f}%)"
+            except Exception as e:
+                logger.error(f"Error calculating range probabilities: {e}")
+                range_info = f"`{prediction['l50'].strftime('%d.%m.%Y')}` - `{prediction['h90'].strftime('%d.%m.%Y')}`"
+
+            # Відображаємо діапазон 25% - 95%
+            DATE_KEYBOARD = date_keyboard(today, 1, days_ahead, start_date=prediction['l50'], end_date=prediction['h90'], prediction_dist=prediction.get('dist'))
+            
+            # Додаємо інформацію до повідомлення
+            prediction_text = (
+                f"{range_info}\n"
+                "Відсотки означають ймовірність того, що ваша черга настане до цієї дати."
+            )
+        else:
+            context.user_data.pop('prediction_bounds', None)
+            DATE_KEYBOARD = date_keyboard(today, 1, days_ahead)
+
         if user_warning != '':
             context.user_data['user_notes'] = 'Остання спроба'
+        
         await update.message.reply_text(
             f"{'УВАГА: '+user_warning if user_warning != '' else ''}"
             f"Введіть бажану дату запису у форматі `ДД.ММ.РРРР`.\n"
             f"Дата повинна бути пізнішою за поточну (`{today.strftime('%d.%m.%Y')}`) та бути робочим днем (Понеділок - П'ятниця).\n"
-            f"Ви можете ввести дату з клавіатури або обрати зі списку на наступні {days_ahead} днів.",
+            f"Ви можете ввести дату з клавіатури або обрати зі списку рекомендованих дат: {prediction_text}",
             parse_mode='Markdown',
             reply_markup=DATE_KEYBOARD # Використовуємо клавіатуру для дати
         )
@@ -1085,6 +1277,12 @@ async def join_get_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     """Отримує дату від користувача, перевіряє її, оновлює або додає запис."""
     global queue_df
     date_input = update.message.text.strip()
+    # Використовуємо regex для пошуку дати, ігноруючи емодзі та відсотки
+    match = re.search(r'\d{2}\.\d{2}\.\d{4}', date_input)
+    if match:
+        date_text = match.group(0)
+    else:
+        date_text = date_input.split()[0]
     user_id = context.user_data.get('temp_id')
     previous_state = context.user_data.get('previous_state', '') # Отримуємо попередній стан
     user_notes = context.user_data.get('user_notes', '') # Отримуємо примітки
@@ -1092,7 +1290,7 @@ async def join_get_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     try:
         # Парсимо дату
-        chosen_date = datetime.datetime.strptime(date_input, "%d.%m.%Y").date()
+        chosen_date = datetime.datetime.strptime(date_text, "%d.%m.%Y").date()
         current_date_obj = datetime.date.today()
 
         # Перевірка, чи дата поточна або пізніша 
@@ -1126,6 +1324,65 @@ async def join_get_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
                 reply_markup=DATE_KEYBOARD
             )
             return JOIN_GETTING_DATE # Залишаємося в тому ж стані        
+
+        # --- ЛОГІКА ПОПЕРЕДЖЕНЬ ---
+        prediction = context.user_data.get('prediction_bounds')
+        warning_shown = context.user_data.get('warning_shown', False)
+        warned_date_str = context.user_data.get('warned_date')
+
+        if prediction:
+            # Check if this is a re-confirmation of the SAME warned date
+            if warning_shown and warned_date_str and warned_date_str == chosen_date.strftime("%d.%m.%Y"):
+                 # User confirmed the warning by re-entering the same date
+                 pass 
+            else:
+                 # Evaluate warning for the new date (or if warning wasn't shown yet)
+                warn_msg = None
+                
+                # Calculate probability for chosen date
+                try:
+                    dist = prediction['dist']
+                    chosen_ord = get_ordinal_date(chosen_date)
+                    chosen_prob = stats.t.cdf(chosen_ord + 1, dist['df'], loc=dist['loc'], scale=dist['scale']) * 100
+                except Exception as e:
+                    logger.error(f"Error calculating chosen date probability: {e}")
+                    chosen_prob = 0
+                    
+                if chosen_date < prediction['l50']:
+                    warn_msg = (
+                        f"⚠️ **Попередження:** Для обраної дати `{chosen_date.strftime('%d.%m.%Y')}` ви маєте **низьку ймовірність** успішно записатися на ВЛК ({chosen_prob:.1f}%).\n"
+                        f"Рекомендовано обирати дату з інтервалу `{prediction['l50'].strftime('%d.%m.%Y')}` - `{prediction['h50'].strftime('%d.%m.%Y')}`."
+                    )
+                elif chosen_date > prediction['h90']:
+                    try:
+                        h90_ord = get_ordinal_date(prediction['h90'])
+                        h90_prob = stats.t.cdf(h90_ord + 1, dist['df'], loc=dist['loc'], scale=dist['scale']) * 100
+                        h90_prob_str = f" ({h90_prob:.1f}%)"
+                    except Exception as e:
+                         h90_prob_str = ""
+
+                    warn_msg = (
+                        f"⚠️ **Попередження:** Обрана дата `{chosen_date.strftime('%d.%m.%Y')}` занадто далеко в майбутньому ({chosen_prob:.1f}%). Вам не треба так довго чекати, шанс успішно записатися на ВЛК майже гарантований > 95%.\n"
+                        f"Ви можете спробувати записатися на ранішу дату (до `{prediction['h90'].strftime('%d.%m.%Y')}`{h90_prob_str})."
+                    )
+                    
+                if warn_msg:
+                    context.user_data['warning_shown'] = True
+                    context.user_data['warned_date'] = chosen_date.strftime("%d.%m.%Y")
+                    
+                    today = datetime.date.today()
+                    DATE_KEYBOARD = date_keyboard(today, 1, days_ahead, start_date=prediction['l50'], end_date=prediction['h90'], prediction_dist=prediction.get('dist'))
+                    
+                    await update.message.reply_text(
+                        f"{warn_msg}\n\nЯкщо ви бажаєте залишити цю дату, введіть її ще раз або натисніть кнопку щоб обрати одну з рекомендованих.",
+                        parse_mode='Markdown',
+                        reply_markup=DATE_KEYBOARD
+                    )
+                    return JOIN_GETTING_DATE
+                else:
+                    # Clear warning state if date is good
+                    context.user_data.pop('warning_shown', None)
+                    context.user_data.pop('warned_date', None)
 
         # Створення нового рядка для додавання в DataFrame
         new_entry = {
@@ -1429,9 +1686,15 @@ async def show_get_option(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def show_get_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Отримує дату для відображення записів і фільтрує чергу."""
     date_input = update.message.text.strip()
+    
+    match = re.search(r'\d{2}\.\d{2}\.\d{4}', date_input)
+    if match:
+        date_text = match.group(0)
+    else:
+        date_text = date_input
 
     try:
-        chosen_date = datetime.datetime.strptime(date_input, "%d.%m.%Y").date()
+        chosen_date = datetime.datetime.strptime(date_text, "%d.%m.%Y").date()
         current_date_obj = datetime.date.today()
         # Перевірка, чи дата поточна або пізніша 
         if chosen_date < current_date_obj:
