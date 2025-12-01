@@ -490,22 +490,39 @@ def get_ua_month(date_obj):
 
 def calculate_date_probability(date_obj, dist):
     """
-    Calculates the cumulative probability that the turn arrives by the end of the given date.
-    Returns the probability as a percentage (0-100).
+    Обчислює кумулятивну ймовірність того, що черга настане до кінця вказаної дати.
+    Повертає ймовірність у відсотках (0-100).
     """
     try:
         ordinal = get_ordinal_date(date_obj)
         loc = dist['loc']
         scale = dist['scale']
         df = dist['df']
-        # Calculate cumulative probability for this ordinal (end of day)
-        # Using ordinal + 1 because ordinal represents the start of the day (or the whole day index),
-        # and we want the probability that the turn arrives BY the end of this day.
+        # Обчислюємо кумулятивну ймовірність для цього порядкового номера (кінець дня)
+        # Використовуємо ordinal + 1, оскільки ordinal представляє початок дня (або індекс цілого дня),
+        # і ми хочемо отримати ймовірність того, що черга настане ДО кінця цього дня.
         prob = stats.t.cdf(ordinal + 1, df, loc=loc, scale=scale)
         return prob * 100
     except Exception as e:
-        logger.error(f"Error calculating probability for {date_obj}: {e}")
+        logger.error(f"Помилка обчислення ймовірності для {date_obj}: {e}")
         return 0.0
+
+def calculate_end_date(start_date, days_count):
+    """
+    Обчислює кінцеву дату, додаючи вказану кількість робочих днів (Пн-Пт) до початкової дати.
+    Це відтворює логіку, що використовується в date_keyboard для визначення останньої кнопки дати.
+    """
+    temp_date = start_date
+    added = 0
+    # Якщо початкова дата є робочим днем, вона враховується як перший день
+    if temp_date.weekday() < 5:
+        added = 1
+    
+    while added < days_count:
+        temp_date += datetime.timedelta(days=1)
+        if temp_date.weekday() < 5:
+            added += 1
+    return temp_date
 
 def date_keyboard(today = datetime.date.today(), days_to_check = 0, days_ahead = 15, start_date=None, end_date=None, prediction_dist=None) -> object:
     # Генеруємо кнопки тільки для робочих днів
@@ -523,15 +540,15 @@ def date_keyboard(today = datetime.date.today(), days_to_check = 0, days_ahead =
         # Генеруємо всі робочі дні в діапазоні
         while iter_date <= limit_date:
              if iter_date.weekday() < 5:
-                 # Формуємо текст: "Пн 25.12" (день тижня, DD.MM)
+                 # Формуємо текст: "Пн: 25.12 (55%)" (день тижня, DD.MM, %)
                  date_str = iter_date.strftime("%d.%m")
                  weekday_str = get_ua_weekday(iter_date)
-                 button_text = f"{weekday_str} {date_str}"
+                 button_text = f"{weekday_str}: {date_str}"
                  
                  if prediction_dist:
                      percent = calculate_date_probability(iter_date, prediction_dist)
                      if percent >= 0.1:
-                         button_text = f"{button_text} {percent:.0f}%"
+                         button_text = f"{button_text} ({percent:.0f}%)"
 
                  flat_keyboard_buttons.append(KeyboardButton(button_text))
              iter_date += datetime.timedelta(days=1)
@@ -545,7 +562,7 @@ def date_keyboard(today = datetime.date.today(), days_to_check = 0, days_ahead =
             if iter_date.weekday() < 5: # Якщо це не субота (5) і не неділя (6)
                 date_str = iter_date.strftime("%d.%m")
                 weekday_str = get_ua_weekday(iter_date)
-                button_text = f"{weekday_str} {date_str}"
+                button_text = f"{weekday_str}: {date_str}"
                 flat_keyboard_buttons.append(KeyboardButton(button_text))
                 buttons_added += 1
             iter_date += datetime.timedelta(days=1)
@@ -1238,28 +1255,46 @@ async def join_get_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
             context.user_data['prediction_bounds'] = prediction
             dist = prediction['dist']
             
-            # Calculate probabilities for range bounds
+            # Обчислюємо ймовірності для меж діапазону
             try:
-                # Determine the actual start date (taking into account 'tomorrow' and weekends)
+                # Визначаємо фактичну дату початку (враховуючи 'завтра' та вихідні)
                 start_date_candidate = prediction['mean']
                 min_date = today + datetime.timedelta(days=1)
                 
                 actual_start_date = max(start_date_candidate, min_date)
                 
-                # Move to next working day if needed
+                # Переходимо до наступного робочого дня, якщо потрібно
                 while actual_start_date.weekday() >= 5:
                      actual_start_date += datetime.timedelta(days=1)
                 
-                prob_start = calculate_date_probability(actual_start_date, dist)
-                prob_h90 = calculate_date_probability(prediction['h90'], dist)
-                
-                range_info = f"`{actual_start_date.strftime('%d.%m.%Y')}` ({prob_start:.0f}%) - `{prediction['h90'].strftime('%d.%m.%Y')}` ({prob_h90:.0f}%)"
-            except Exception as e:
-                logger.error(f"Error calculating range probabilities: {e}")
-                range_info = f"`{prediction['mean'].strftime('%d.%m.%Y')}` - `{prediction['h90'].strftime('%d.%m.%Y')}`"
+                # Якщо початкова дата ПІЗНІШЕ кінцевої дати (наприклад, малий ID, прогноз у минулому),
+                # ми повинні просто показати наступні N доступних днів, починаючи з завтра
+                if actual_start_date > prediction['h90']:
+                     actual_start_date = min_date
+                     while actual_start_date.weekday() >= 5:
+                         actual_start_date += datetime.timedelta(days=1)
+                     # Примусово встановлюємо кінцеву дату None, щоб date_keyboard згенерувала N днів наперед
+                     calc_end_date = None
+                else:
+                     calc_end_date = prediction['h90']
 
-            # Відображаємо діапазон 50% - 95%
-            DATE_KEYBOARD = date_keyboard(today, 1, days_ahead, start_date=actual_start_date, end_date=prediction['h90'], prediction_dist=prediction.get('dist'))
+                prob_start = calculate_date_probability(actual_start_date, dist)
+                if calc_end_date:
+                    prob_h90 = calculate_date_probability(calc_end_date, dist)
+                    end_date_str = f"`{calc_end_date.strftime('%d.%m.%Y')}` ({prob_h90:.0f}%)"
+                else:
+                    est_end_date = calculate_end_date(actual_start_date, days_ahead)
+                    prob_end = calculate_date_probability(est_end_date, dist)
+                    end_date_str = f"`{est_end_date.strftime('%d.%m.%Y')}` ({prob_end:.0f}%)"
+
+                range_info = f"`{actual_start_date.strftime('%d.%m.%Y')}` ({prob_start:.0f}%) - {end_date_str}"
+            except Exception as e:
+                logger.error(f"Помилка обчислення ймовірностей діапазону: {e}")
+                range_info = f"`{prediction['mean'].strftime('%d.%m.%Y')}` - `{prediction['h90'].strftime('%d.%m.%Y')}`"
+                calc_end_date = prediction['h90']
+
+            # Відображаємо діапазон
+            DATE_KEYBOARD = date_keyboard(today, 1, days_ahead, start_date=actual_start_date, end_date=calc_end_date, prediction_dist=prediction.get('dist'))
             
             # Додаємо інформацію до повідомлення
             prediction_text = (
@@ -1310,7 +1345,7 @@ async def join_get_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             date_text = match_full.group(0)
             chosen_date = datetime.datetime.strptime(date_text, "%d.%m.%Y").date()
         else:
-            # Спроба розпарсити формат з кнопки: "Вт 20.01 51%" -> шукаємо DD.MM
+            # Спроба розпарсити формат з кнопки: "Вт: 20.01 (51%)" -> шукаємо DD.MM
             match_short = re.search(r'(\d{1,2})\.(\d{1,2})', date_input)
             if match_short:
                 day = int(match_short.group(1))
@@ -1400,30 +1435,55 @@ async def join_get_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
                 chosen_prob = 0
                 
             if chosen_date < prediction['mean']:
-                try:
-                    prob_mean = calculate_date_probability(prediction['mean'], dist)
-                    prob_h90 = calculate_date_probability(prediction['h90'], dist)
-                    
-                    range_info = f"`{prediction['mean'].strftime('%d.%m.%Y')}` ({prob_mean:.0f}%) - `{prediction['h90'].strftime('%d.%m.%Y')}` ({prob_h90:.0f}%)"
-                except Exception as e:
-                    logger.error(f"Error calculating range probabilities for warning: {e}")
-                    range_info = f"`{prediction['mean'].strftime('%d.%m.%Y')}` - `{prediction['h90'].strftime('%d.%m.%Y')}`"
+                # Показуємо попередження лише якщо обрана ймовірність дійсно низька (наприклад, < 50%)
+                # Якщо prediction['mean'] у минулому, chosen_prob все одно може бути високою (наприклад, 100%)
+                if chosen_prob < 50:
+                    try:
+                        prob_mean = calculate_date_probability(prediction['mean'], dist)
+                        prob_h90 = calculate_date_probability(prediction['h90'], dist)
+                        
+                        range_info = f"`{prediction['mean'].strftime('%d.%m.%Y')}` ({prob_mean:.0f}%) - `{prediction['h90'].strftime('%d.%m.%Y')}` ({prob_h90:.0f}%)"
+                    except Exception as e:
+                        logger.error(f"Помилка обчислення ймовірностей діапазону для попередження: {e}")
+                        range_info = f"`{prediction['mean'].strftime('%d.%m.%Y')}` - `{prediction['h90'].strftime('%d.%m.%Y')}`"
 
-                warn_msg = (
-                    f"⚠️ *Попередження:* Для обраної дати `{chosen_date.strftime('%d.%m.%Y')}` ви маєте *низьку ймовірність* почати ВЛК ({chosen_prob:.1f}%).\n"
-                    f"Рекомендовано обирати дату з інтервалу {range_info}."
-                )
+                    warn_msg = (
+                        f"⚠️ *Попередження:* Для обраної дати `{chosen_date.strftime('%d.%m.%Y')}` ви маєте *низьку ймовірність* почати ВЛК ({chosen_prob:.1f}%).\n"
+                        f"Рекомендовано обирати дату з інтервалу {range_info}."
+                    )
             elif chosen_date > prediction['h90']:
-                try:
-                    h90_prob = calculate_date_probability(prediction['h90'], dist)
-                    h90_prob_str = f"{h90_prob:.1f}%"
-                except Exception as e:
-                        h90_prob_str = ""
+                # Якщо прогнозована "безпечна" дата (h90) в минулому або дуже скоро,
+                # вибір дати трохи в майбутньому (наприклад, в межах стандартного діапазону кнопок) не повинен викликати попередження.
+                # Ми перевіряємо, чи є обрана дата невиправдано далекою відносно стандартного вікна.
+                # Стандартне вікно - це те, що показується на кнопках (days_ahead робочих днів).
+                
+                # Починаємо від "завтра" (або від наступного робочого дня)
+                current_start = datetime.date.today() + datetime.timedelta(days=1)
+                while current_start.weekday() >= 5:
+                    current_start += datetime.timedelta(days=1)
+                
+                # Використовуємо ту саму логіку, що й для кнопок, щоб знайти кінець стандартного вікна
+                standard_window_end = calculate_end_date(current_start, days_ahead)
+                
+                threshold_date = max(prediction['h90'], standard_window_end)
 
-                warn_msg = (
-                    f"⚠️ *Попередження:* Обрана дата `{chosen_date.strftime('%d.%m.%Y')}` *занадто далеко в майбутньому*. "
-                    f"Вам не треба так довго чекати, шанс успішно почати ВЛК майже гарантований для ближчих дат (наприклад {h90_prob_str} для `{prediction['h90'].strftime('%d.%m.%Y')}`)."
-                )
+                if chosen_date > threshold_date:
+                    # Визначаємо дату для прикладу в попередженні.
+                    # Якщо h90 в минулому, використовуємо "завтра" (або наступний робочий день) як більш релевантний приклад.
+                    example_date = prediction['h90']
+                    if example_date < current_start:
+                        example_date = current_start # current_start вже враховує вихідні і починається від завтра
+
+                    try:
+                        example_prob = calculate_date_probability(example_date, dist)
+                        example_prob_str = f"{example_prob:.1f}%"
+                    except Exception as e:
+                            example_prob_str = ""
+
+                    warn_msg = (
+                        f"⚠️ *Попередження:* Обрана дата `{chosen_date.strftime('%d.%m.%Y')}` *занадто далеко в майбутньому*. "
+                        f"Вам не треба так довго чекати, шанс успішно почати ВЛК майже гарантований для ближчих дат (наприклад {example_prob_str} для `{example_date.strftime('%d.%m.%Y')}`)."
+                    )
                 
             if warn_msg:
                 context.user_data['warning_shown'] = True
@@ -1438,7 +1498,16 @@ async def join_get_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
                 while actual_start_date.weekday() >= 5:
                         actual_start_date += datetime.timedelta(days=1)
 
-                DATE_KEYBOARD = date_keyboard(today, 1, days_ahead, start_date=actual_start_date, end_date=prediction['h90'], prediction_dist=prediction.get('dist'))
+                # If start date is > end date, we need to fallback to N days logic
+                if actual_start_date > prediction['h90']:
+                     actual_start_date = min_date
+                     while actual_start_date.weekday() >= 5:
+                         actual_start_date += datetime.timedelta(days=1)
+                     calc_end_date = None
+                else:
+                     calc_end_date = prediction['h90']
+
+                DATE_KEYBOARD = date_keyboard(today, 1, days_ahead, start_date=actual_start_date, end_date=calc_end_date, prediction_dist=prediction.get('dist'))
                 
                 await update.message.reply_text(
                     f"{warn_msg}\n\nЯкщо ви бажаєте залишити цю дату, введіть її ще раз або натисніть кнопку щоб обрати одну з рекомендованих.",
