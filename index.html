@@ -428,6 +428,14 @@
                         actualDate: actualDate,
                         actualType: actualType
                     };
+
+                    // Update URL
+                    if (window.history.replaceState) {
+                        const url = new URL(window.location);
+                        url.searchParams.set('id', targetId);
+                        window.history.replaceState({}, '', url);
+                    }
+
                     chart.update();
                 }
             };
@@ -459,6 +467,18 @@
                     input.addEventListener('keypress', (e) => {
                         if (e.key === 'Enter') handleSearch();
                     });
+
+                    // Check URL for ID param on load
+                    const urlParams = new URLSearchParams(window.location.search);
+                    const idParam = urlParams.get('id');
+                    if (idParam) {
+                        const val = parseInt(idParam, 10);
+                        if (!isNaN(val)) {
+                            input.value = val;
+                            // Use setTimeout to ensure chart is ready
+                            setTimeout(() => freezeAtId(chart, val), 0);
+                        }
+                    }
                     
                     // Handle click to freeze/unfreeze
                     chart.canvas.addEventListener('click', (e) => {
@@ -466,6 +486,13 @@
                             // Unfreeze
                             chart.frozen = false;
                             chart.options.plugins.tooltip.enabled = true; // Re-enable native
+                            
+                            // Clear URL param
+                            if (window.history.replaceState) {
+                                const url = new URL(window.location);
+                                url.searchParams.delete('id');
+                                window.history.replaceState({}, '', url);
+                            }
                             
                             // Remove custom guides
                             // We handle drawing in afterDraw, so just forcing update clears them
@@ -538,8 +565,9 @@
                         
                         // Add actual date info if available
                         if (data.actualDate) {
-                            // Add separator or just append
                             textLines.unshift(`${data.actualType}: ${formatDate(data.actualDate)}`);
+                        } else {
+                            textLines.unshift('Немає запису!');
                         }
                         
                         // Position box fixed at Top-Left of the chart area
@@ -561,27 +589,23 @@
                         ctx.strokeRect(boxX, boxY, boxWidth, boxHeight);
                         
                         // Text
-                        ctx.fillStyle = 'black';
-                        ctx.font = '12px sans-serif';
                         ctx.textAlign = 'left';
                         ctx.textBaseline = 'middle';
                         
                         textLines.forEach((line, i) => {
-                            // Bold: Queue ID (which is index 1 if actual exists, or 0) and Mean (which is index 4 or 3)
-                            // Logic:
-                            // If actual exists: 0=Actual, 1=ID, 2=5%, 3=25%, 4=Mean...
-                            // If not: 0=ID, 1=5%, 2=25%, 3=Mean...
-                            
-                            const hasActual = !!data.actualDate;
-                            let isBold = false;
-                            
-                            if (hasActual) {
-                                if (i === 0 || i === 1 || i === 4) isBold = true; // Actual, ID, Mean
-                            } else {
-                                if (i === 0 || i === 3) isBold = true; // ID, Mean
-                            }
+                            // 0: Status (Actual Date or "Немає запису!")
+                            // 1: Queue ID
+                            // 4: Mean (50%)
+                            let isBold = (i === 0 || i === 1 || i === 4);
                             
                             ctx.font = isBold ? 'bold 12px sans-serif' : '12px sans-serif';
+                            
+                            if (!data.actualDate && i === 0) {
+                                ctx.fillStyle = 'red';
+                            } else {
+                                ctx.fillStyle = 'black';
+                            }
+                            
                             ctx.fillText(line, boxX + padding, boxY + padding + i * lineHeight + lineHeight/2);
                         });
                         

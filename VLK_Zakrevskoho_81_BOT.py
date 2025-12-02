@@ -45,6 +45,26 @@ logging.getLogger('asyncio').setLevel(logging.DEBUG)
 # --- ЗАВАНТАЖЕННЯ КОНСТАНТ З CONFIG.INI ---
 config = configparser.ConfigParser()
 
+# Глобальні змінні з конфігурації
+TOKEN = ""
+ADMIN_IDS = []
+GROUP_ID = ""
+STATUS_FILE = ""
+BANLIST = []
+SERVICE_ACCOUNT_KEY_PATH = ""
+SPREADSHEET_ID = ""
+SHEET_NAME = ""
+STATS_SHEET_ID = ""
+STATS_WORKSHEET_NAME = ""
+
+# Глобальні змінні для Google Sheets
+SERVICE_ACCOUNT_SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
+SHEETS_SERVICE = None
+CREDS = None
+
+# Глобальний DataFrame
+queue_df = None
+
 # Функція для збереження config.ini
 def save_config():
     '''
@@ -60,58 +80,69 @@ def save_config():
     with open('config.ini', 'w') as configfile:
         config.write(configfile)
 
-try:
-    config.read('config.ini') # Назва файлу конфігурації
-    
-    # Отримуємо значення з секції BOT_SETTINGS
-    TOKEN = config['BOT_SETTINGS']['TOKEN']
-    # ADMIN_IDS: розбиваємо рядок на список чисел
-    admin_ids_str = config['BOT_SETTINGS']['ADMIN_IDS']
-    # Оновлюємо ADMIN_IDS як список цілих чисел
-    ADMIN_IDS = [int(id_str.strip()) for id_str in admin_ids_str.split(',') if id_str.strip()]
-    GROUP_ID = config['BOT_SETTINGS']['GROUP_ID']
-    # Отримуємо значення з секції STATUS
-    STATUS_FILE = config['BOT_SETTINGS']['STATUS_FILE']
-    # BANLIST: розбиваємо рядок на список чисел
-    ban_ids_str = config['BOT_SETTINGS']['BANLIST']
-    # Оновлюємо ADMIN_IDS як список цілих чисел
-    BANLIST = [int(id_str.strip()) for id_str in ban_ids_str.split(',') if id_str.strip()]    
+def initialize_bot():
+    global TOKEN, ADMIN_IDS, GROUP_ID, STATUS_FILE, BANLIST
+    global SERVICE_ACCOUNT_KEY_PATH, SPREADSHEET_ID, SHEET_NAME
+    global STATS_SHEET_ID, STATS_WORKSHEET_NAME
+    global SHEETS_SERVICE, CREDS, queue_df
 
-    # Отримуємо значення з секції GOOGLE_SHEETS
-    SERVICE_ACCOUNT_KEY_PATH = config['GOOGLE_SHEETS']['SERVICE_ACCOUNT_KEY_PATH']
-    SPREADSHEET_ID = config['GOOGLE_SHEETS']['SPREADSHEET_ID']
-    SHEET_NAME = config['GOOGLE_SHEETS']['SHEET_NAME']
-    STATS_SHEET_ID = config['GOOGLE_SHEETS']['STATS_SHEET_ID']
-    STATS_WORKSHEET_NAME = config['GOOGLE_SHEETS']['STATS_WORKSHEET_NAME']
-    
-    logger.info("Константи успішно завантажено з config.ini")
+    try:
+        config.read('config.ini') # Назва файлу конфігурації
+        
+        # Отримуємо значення з секції BOT_SETTINGS
+        TOKEN = config['BOT_SETTINGS']['TOKEN']
+        # ADMIN_IDS: розбиваємо рядок на список чисел
+        admin_ids_str = config['BOT_SETTINGS']['ADMIN_IDS']
+        # Оновлюємо ADMIN_IDS як список цілих чисел
+        ADMIN_IDS = [int(id_str.strip()) for id_str in admin_ids_str.split(',') if id_str.strip()]
+        GROUP_ID = config['BOT_SETTINGS']['GROUP_ID']
+        # Отримуємо значення з секції STATUS
+        STATUS_FILE = config['BOT_SETTINGS']['STATUS_FILE']
+        # BANLIST: розбиваємо рядок на список чисел
+        ban_ids_str = config['BOT_SETTINGS']['BANLIST']
+        # Оновлюємо ADMIN_IDS як список цілих чисел
+        BANLIST = [int(id_str.strip()) for id_str in ban_ids_str.split(',') if id_str.strip()]    
 
-except KeyError as e:
-    logger.error(f"Помилка: Не знайдено ключ '{e}' у файлі config.ini. Перевірте, чи всі налаштування присутні.")
-    exit(1) # Завершуємо роботу, якщо конфігурація неповна
-except FileNotFoundError:
-    logger.error("Помилка: Файл config.ini не знайдено. Будь ласка, створіть його.")
-    exit(1) # Завершуємо роботу, якщо файл не знайдено
-except Exception as e:
-    logger.error(f"Невідома помилка при читанні config.ini: {e}")
-    exit(1)
+        # Отримуємо значення з секції GOOGLE_SHEETS
+        SERVICE_ACCOUNT_KEY_PATH = config['GOOGLE_SHEETS']['SERVICE_ACCOUNT_KEY_PATH']
+        SPREADSHEET_ID = config['GOOGLE_SHEETS']['SPREADSHEET_ID']
+        SHEET_NAME = config['GOOGLE_SHEETS']['SHEET_NAME']
+        STATS_SHEET_ID = config['GOOGLE_SHEETS']['STATS_SHEET_ID']
+        STATS_WORKSHEET_NAME = config['GOOGLE_SHEETS']['STATS_WORKSHEET_NAME']
+        
+        logger.info("Константи успішно завантажено з config.ini")
 
-# --- Налаштування Google Sheets API ---
-SERVICE_ACCOUNT_SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
-SHEETS_SERVICE = None # Змінна для зберігання сервісу Google Sheets
+    except KeyError as e:
+        logger.error(f"Помилка: Не знайдено ключ '{e}' у файлі config.ini. Перевірте, чи всі налаштування присутні.")
+        if __name__ == "__main__":
+            exit(1)
+    except FileNotFoundError:
+        logger.error("Помилка: Файл config.ini не знайдено. Будь ласка, створіть його.")
+        if __name__ == "__main__":
+            exit(1)
+    except Exception as e:
+        logger.error(f"Невідома помилка при читанні config.ini: {e}")
+        if __name__ == "__main__":
+            exit(1)
 
-try:
-    CREDS = service_account.Credentials.from_service_account_file(
-        SERVICE_ACCOUNT_KEY_PATH, scopes=SERVICE_ACCOUNT_SCOPES
-    )
-    SHEETS_SERVICE = build('sheets', 'v4', credentials=CREDS)
-    logger.info("Успішно підключено до Google Sheets API.")
-except FileNotFoundError:
-    logger.error(f"Помилка: Файл ключа сервісного облікового запису не знайдено за шляхом: {SERVICE_ACCOUNT_KEY_PATH}")
-    exit(1)
-except Exception as e:
-    logger.error(f"Помилка ініціалізації Google Sheets API: {e}")
-    exit(1)
+    # --- Налаштування Google Sheets API ---
+    try:
+        CREDS = service_account.Credentials.from_service_account_file(
+            SERVICE_ACCOUNT_KEY_PATH, scopes=SERVICE_ACCOUNT_SCOPES
+        )
+        SHEETS_SERVICE = build('sheets', 'v4', credentials=CREDS)
+        logger.info("Успішно підключено до Google Sheets API.")
+    except FileNotFoundError:
+        logger.error(f"Помилка: Файл ключа сервісного облікового запису не знайдено за шляхом: {SERVICE_ACCOUNT_KEY_PATH}")
+        if __name__ == "__main__":
+            exit(1)
+    except Exception as e:
+        logger.error(f"Помилка ініціалізації Google Sheets API: {e}")
+        if __name__ == "__main__":
+            exit(1)
+            
+    # Ініціалізація DataFrame при запуску
+    queue_df = load_queue_data()
 
 # Стан для ConversationHandler для запису (/join)
 JOIN_GETTING_ID, JOIN_GETTING_DATE = range(2)
@@ -427,8 +458,6 @@ def save_queue_data_full(df: pd.DataFrame) -> bool:
         return False
 
 
-# Ініціалізація DataFrame при запуску
-queue_df = load_queue_data()
 
 # --- СТАНДАРТНА КЛАВІАТУРА З КОМАНДАМИ ---
 # Важливо: хоча на кнопках текст, для внутрішньої логіки бот все ще реагує на цей текст як на "команду"
@@ -484,10 +513,6 @@ def get_ua_weekday(date_obj):
     weekdays = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Нд']
     return weekdays[date_obj.weekday()]
 
-def get_ua_month(date_obj):
-    months = ['січ', 'лют', 'бер', 'кві', 'тра', 'чер', 'лип', 'сер', 'вер', 'жов', 'лис', 'гру']
-    return months[date_obj.month - 1]
-
 def calculate_date_probability(date_obj, dist):
     """
     Обчислює кумулятивну ймовірність того, що черга настане до кінця вказаної дати.
@@ -540,8 +565,8 @@ def date_keyboard(today = datetime.date.today(), days_to_check = 0, days_ahead =
         # Генеруємо всі робочі дні в діапазоні
         while iter_date <= limit_date:
              if iter_date.weekday() < 5:
-                 # Формуємо текст: "Пн: 25.12 (55%)" (день тижня, DD.MM, %)
-                 date_str = iter_date.strftime("%d.%m")
+                 # Формуємо текст: "Пн: 25.12.25 (55%)" (день тижня, DD.MM.YY, %)
+                 date_str = iter_date.strftime("%d.%m.%y")
                  weekday_str = get_ua_weekday(iter_date)
                  button_text = f"{weekday_str}: {date_str}"
                  
@@ -560,7 +585,7 @@ def date_keyboard(today = datetime.date.today(), days_to_check = 0, days_ahead =
         iter_date = current_check_date
         while buttons_added < days_ahead:
             if iter_date.weekday() < 5: # Якщо це не субота (5) і не неділя (6)
-                date_str = iter_date.strftime("%d.%m")
+                date_str = iter_date.strftime("%d.%m.%y")
                 weekday_str = get_ua_weekday(iter_date)
                 button_text = f"{weekday_str}: {date_str}"
                 flat_keyboard_buttons.append(KeyboardButton(button_text))
@@ -1353,16 +1378,20 @@ async def join_get_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     # Використовуємо regex для пошуку дати, ігноруючи емодзі та відсотки
     # Оновлений regex для підтримки формату без року (або з роком) на кнопках, але користувач може ввести повну дату
-    # Пріоритет: спочатку шукаємо повну дату dd.mm.yyyy, потім dd/mm
+    # Пріоритет: спочатку шукаємо повну дату dd.mm.yyyy або dd.mm.yy
     
-    match_full = re.search(r'(\d{2})\.(\d{2})\.(\d{4})', date_input)
+    match_full = re.search(r'(\d{2})\.(\d{2})\.(\d{2,4})', date_input)
     
     try:
         if match_full:
             date_text = match_full.group(0)
-            chosen_date = datetime.datetime.strptime(date_text, "%d.%m.%Y").date()
+            # Якщо рік має 2 цифри, strptime %y обробить його (як 20xx)
+            if len(match_full.group(3)) == 2:
+                 chosen_date = datetime.datetime.strptime(date_text, "%d.%m.%y").date()
+            else:
+                 chosen_date = datetime.datetime.strptime(date_text, "%d.%m.%Y").date()
         else:
-            # Спроба розпарсити формат з кнопки: "Вт: 20.01 (51%)" -> шукаємо DD.MM
+            # Спроба розпарсити формат з кнопки: "Вт: 20.01 (51%)" -> шукаємо DD.MM (старий формат, або якщо без року)
             match_short = re.search(r'(\d{1,2})\.(\d{1,2})', date_input)
             if match_short:
                 day = int(match_short.group(1))
@@ -1846,14 +1875,43 @@ async def show_get_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     """Отримує дату для відображення записів і фільтрує чергу."""
     date_input = update.message.text.strip()
     
-    match = re.search(r'\d{2}\.\d{2}\.\d{4}', date_input)
+    match = re.search(r'(\d{2})\.(\d{2})\.(\d{2,4})', date_input)
     if match:
         date_text = match.group(0)
+        try:
+            if len(match.group(3)) == 2:
+                 chosen_date = datetime.datetime.strptime(date_text, "%d.%m.%y").date()
+            else:
+                 chosen_date = datetime.datetime.strptime(date_text, "%d.%m.%Y").date()
+        except ValueError:
+             # Якщо парсинг не вдався
+             chosen_date = None
     else:
+        # Спроба розпарсити без року (dd.mm) - додаємо поточний рік або наступний
+        # ... (логіка якщо треба, але поки залишимо просте)
         date_text = date_input
+        chosen_date = None
 
     try:
-        chosen_date = datetime.datetime.strptime(date_text, "%d.%m.%Y").date()
+        if not chosen_date:
+             # Fallback old logic attempt or direct parse
+             chosen_date = datetime.datetime.strptime(date_text, "%d.%m.%Y").date()
+    except ValueError:
+         # Try with 2 digit year as fallback
+         try:
+            chosen_date = datetime.datetime.strptime(date_text, "%d.%m.%y").date()
+         except ValueError:
+            logger.warning(f"Користувач {get_user_log_info(update.effective_user)} ввів некоректний формат дати для перегляду: '{date_input}'")
+            today = datetime.date.today() # Поточна дата
+            DATE_KEYBOARD=date_keyboard(today, 0, days_ahead)
+            await update.message.reply_html(
+                "Невірний формат дати. Будь ласка, введіть дату у форматі <code>ДД.ММ.РР</code> (наприклад, 25.12.25) або скасуйте дію.",
+                reply_markup=DATE_KEYBOARD
+            )
+            return SHOW_GETTING_DATE
+
+    try:
+        # chosen_date is already a date object here
         current_date_obj = datetime.date.today()
         # Перевірка, чи дата поточна або пізніша 
         if chosen_date < current_date_obj:
@@ -2194,6 +2252,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
                 logger.error("Не вдалося відправити повідомлення про помилку користувачу: %s", e)
 
 def main() -> None:
+    initialize_bot()
     application = (
         Application.builder()
         .token(TOKEN)

@@ -1,0 +1,10 @@
+python-telegram-bot>=20.0
+pandas
+google-api-python-client
+google-auth
+APScheduler
+pytz
+numpy
+scipy
+httpx
+pytest
