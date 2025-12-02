@@ -1582,8 +1582,8 @@ async def join_get_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     if save_queue_data(new_entry_df): # Перевіряємо результат збереження
         # Оновлюємо глобальний DataFrame ТІЛЬКИ ПІСЛЯ УСПІШНОГО ЗБЕРЕЖЕННЯ
         queue_df = pd.concat([queue_df, new_entry_df], ignore_index=True)
-        notification_text = f"✅ Користувач {update.effective_user.mention_html()} створив запис для\nID <code>{user_id}</code> на <code>{chosen_date.strftime('%d.%m.%Y')}</code>" 
-        #await send_group_notification(context, notification_text)
+        notification_text = f"✅ Користувач {update.effective_user.mention_html()}\nстворив або переніс запис для\nID <code>{user_id}</code> на <code>{chosen_date.strftime('%d.%m.%Y')}</code>" 
+        await send_group_notification(context, notification_text)
         message_text = f"Ви успішно створили заявку на запис/перенос дати в черзі!\nВаш ID: `{user_id}`, Обрана дата: `{chosen_date.strftime('%d.%m.%Y')}`\nСтатус заявки: `На розгляді`\nВаша заявка на розгляді у адміністраторів.\nЯкщо вона буде \"Ухвалена\", то через деякий час з'явиться в жовтій таблиці 🟡TODO."
         await update.message.reply_text(message_text, parse_mode='Markdown', reply_markup=MAIN_KEYBOARD)
         logger.info(f"Запис користувача {get_user_log_info(update.effective_user)} (ID: {user_id}) оновлено/додано на дату: {chosen_date.strftime('%d.%m.%Y')}. Попередня дата: {previous_state if previous_state else 'новий запис'}")
@@ -1953,7 +1953,7 @@ async def show_get_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         while next_working_day.weekday() >= 5:  # 5 is Saturday, 6 is Sunday
             next_working_day += datetime.timedelta(days=1)
         if chosen_date == next_working_day:
-            await display_queue_data(update, filtered_df, title=f"Поточна черга зі статусом \"Ухвалено\" на `{chosen_date.strftime('%d.%m.%Y')}`:\n", reply_markup=MAIN_KEYBOARD, iConfirmation = True)
+            await display_queue_data(update, filtered_df, title=f"Поточна черга зі статусом \"Ухвалено\" на `{chosen_date.strftime('%d.%m.%Y')}`:\n", reply_markup=MAIN_KEYBOARD, iConfirmation = False) #iConfirmation статус про підтвердження візиту на завтра при перегляді черги на завтра
         else:
             await display_queue_data(update, filtered_df, title=f"Поточна черга зі статусом \"Ухвалено\" на `{chosen_date.strftime('%d.%m.%Y')}`:\n", reply_markup=MAIN_KEYBOARD)
         context.user_data.clear() # Очищуємо тимчасові дані
@@ -2098,7 +2098,7 @@ async def date_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
             remind = True
             nr_days = 'на сьогодні'        
         if target_date_dt == one_day_later:
-            poll_confirm = True
+            poll_confirm = False # тимчасово відключаємо підтвердження візиту (голосування) поки не зробимо повний список на завтра
             remind = True
             nr_days = 'на завтра'
         if target_date_dt == three_days_later:
@@ -2394,6 +2394,7 @@ def main() -> None:
         callback=notify_status,
         interval=datetime.timedelta(minutes=5),
         first=datetime.time(hour=7, minute=3, tzinfo=kyiv_tz), # Перший запуск о 7:00
+        last=datetime.time(hour=23, minute=33, tzinfo=kyiv_tz), # Останній запуск о 23:30
         name="Status Change Notification"
     )
     logger.info(f"Завдання 'Status Change Notification' заплановано кожні 30 хвилин з 07:00 по 23:30 за {kyiv_tz.tzname(datetime.datetime.now())}")
