@@ -15,6 +15,7 @@ import pandas as pd
 import datetime
 import json
 import os
+import locale
 import re # Для перевірки формату ID
 import logging # Для журналу
 import configparser
@@ -87,6 +88,12 @@ def initialize_bot():
     global SHEETS_SERVICE, CREDS, queue_df
 
     try:
+        # Спробуємо встановити українську локаль
+        try:
+            locale.setlocale(locale.LC_TIME, 'uk_UA.UTF-8')
+        except locale.Error:
+            logger.warning("Не вдалося встановити локаль uk_UA.UTF-8, дати можуть відображатися англійською.")
+
         config.read('config.ini') # Назва файлу конфігурації
         
         # Отримуємо значення з секції BOT_SETTINGS
@@ -180,19 +187,36 @@ def calculate_prediction(user_id, stats_df):
         return None
         
     df = stats_df.copy()
+    
+    # Перевіряємо наявність необхідних стовпців
+    required_cols = ['Останній номер що зайшов', 'Перший номер що зайшов', 'Дата прийому']
+    if not all(col in df.columns for col in required_cols):
+        return None
+
     # Перетворення в числовий формат та формат дати
-    df['id'] = pd.to_numeric(df['Останній номер що зайшов'], errors='coerce')
+    df['id_max'] = pd.to_numeric(df['Останній номер що зайшов'], errors='coerce')
+    df['id_min'] = pd.to_numeric(df['Перший номер що зайшов'], errors='coerce')
     df['date'] = pd.to_datetime(df['Дата прийому'], format='%d.%m.%Y', dayfirst=True, errors='coerce').dt.date
-    df = df.dropna(subset=['id', 'date'])
+    
+    # Видаляємо рядки, де немає дати або хоча б одного з ID (min або max) - сувора вимога як в index.html
+    df = df.dropna(subset=['id_max', 'id_min', 'date'])
     
     if len(df) < 5: # Потрібна достатня кількість точок
         return None
 
     df['ordinal'] = df['date'].apply(get_ordinal_date)
-    df = df.sort_values('ordinal')
     
-    X = df['id'].values
-    Y = df['ordinal'].values
+    # Розраховуємо середній ID для кожного дня (якщо в день було кілька записів, групуємо)
+    # В index.html логіка: (min + max) для кожного рядка, потім середнє для дня.
+    # Тут ми беремо середнє для рядка:
+    df['avg_id'] = (df['id_max'] + df['id_min']) / 2.0
+    
+    # Групуємо за датою (ordinal), щоб отримати одну точку на день
+    daily_stats = df.groupby('ordinal')['avg_id'].mean().reset_index()
+    daily_stats = daily_stats.sort_values('ordinal')
+    
+    X = daily_stats['avg_id'].values
+    Y = daily_stats['ordinal'].values
     n = len(X)
     
     # Експоненційні ваги
@@ -250,7 +274,7 @@ def calculate_prediction(user_id, stats_df):
     min_feasible = max_hist_ord + 1
     
     # Обмежуємо нижню межу, тільки якщо ID в майбутньому (більше максимального історичного ID)
-    if user_id > df['id'].max():
+    if user_id > df['id_max'].max():
         l90_ord = max(l90_ord, min_feasible)
         l50_ord = max(l50_ord, min_feasible)
         # Перевірка валідності початку діапазону
@@ -360,7 +384,11 @@ async def get_stats_data() -> pd.DataFrame | None:
         # 2. Перетворюємо список списків у DataFrame
         stats_df = pd.DataFrame(list_of_lists[1:], columns=list_of_lists[0])
         # 3. Підготовка даних (перетворення типів)
-        stats_df['Останній номер що зайшов'] = stats_df['Останній номер що зайшов'].apply(extract_main_id)
+        if 'Останній номер що зайшов' in stats_df.columns:
+            stats_df['Останній номер що зайшов'] = stats_df['Останній номер що зайшов'].apply(extract_main_id)
+        if 'Перший номер що зайшов' in stats_df.columns:
+            stats_df['Перший номер що зайшов'] = stats_df['Перший номер що зайшов'].apply(extract_main_id)
+            
         stats_df['Дата прийому'] = pd.to_datetime(stats_df['Дата прийому'], format="%d.%m.%Y", dayfirst=True, errors='coerce')
         
         logger.info("Дані з аркуша 'Stats' успішно завантажено та оброблено.")
@@ -510,8 +538,7 @@ SHOW_OPTION_KEYBOARD = ReplyKeyboardMarkup([
         one_time_keyboard=True, resize_keyboard=True)
 
 def get_ua_weekday(date_obj):
-    weekdays = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Нд']
-    return weekdays[date_obj.weekday()]
+    return date_obj.strftime('%a').title()
 
 def calculate_date_probability(date_obj, dist):
     """
@@ -1380,7 +1407,7 @@ async def join_get_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     # Оновлений regex для підтримки формату без року (або з роком) на кнопках, але користувач може ввести повну дату
     # Пріоритет: спочатку шукаємо повну дату dd.mm.yyyy або dd.mm.yy
     
-    match_full = re.search(r'(\d{2})\.(\d{2})\.(\d{2,4})', date_input)
+    match_full = re.search(r'(\d{1,2})\.(\d{1,2})\.(\d{4}|\d{2})', date_input)
     
     try:
         if match_full:
@@ -1391,27 +1418,8 @@ async def join_get_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             else:
                  chosen_date = datetime.datetime.strptime(date_text, "%d.%m.%Y").date()
         else:
-            # Спроба розпарсити формат з кнопки: "Вт: 20.01 (51%)" -> шукаємо DD.MM (старий формат, або якщо без року)
-            match_short = re.search(r'(\d{1,2})\.(\d{1,2})', date_input)
-            if match_short:
-                day = int(match_short.group(1))
-                month = int(match_short.group(2))
-                
-                # Визначаємо рік. Якщо місяць менший за поточний, це наступний рік
-                # Але треба бути обережним, якщо поточний місяць грудень, а кнопка січень
-                current_today = datetime.date.today()
-                year = current_today.year
-                
-                # Проста евристика: якщо дата вже минула в цьому році, то це наступний рік
-                candidate_date = datetime.date(year, month, day)
-                if candidate_date < current_today:
-                    year += 1
-                    
-                chosen_date = datetime.date(year, month, day)
-            else:
-                 # Fallback: пробуємо просто перше слово, якщо це не спрацювало раніше
-                 date_text = date_input.split()[0]
-                 chosen_date = datetime.datetime.strptime(date_text, "%d.%m.%Y").date()
+            # Якщо regex не знайшов дату, викликаємо помилку для переходу в except
+            raise ValueError()
 
     except ValueError:
         logger.warning(f"Користувач {get_user_log_info(update.effective_user)} ввів некоректний формат дати: '{date_input}'")
@@ -1887,25 +1895,23 @@ async def show_get_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
              # Якщо парсинг не вдався
              chosen_date = None
     else:
-        # Спроба розпарсити без року (dd.mm) - додаємо поточний рік або наступний
-        # ... (логіка якщо треба, але поки залишимо просте)
         date_text = date_input
         chosen_date = None
 
     try:
         if not chosen_date:
-             # Fallback old logic attempt or direct parse
-             chosen_date = datetime.datetime.strptime(date_text, "%d.%m.%Y").date()
+            # Fallback old logic attempt or direct parse
+            chosen_date = datetime.datetime.strptime(date_text, "%d.%m.%Y").date()
     except ValueError:
-         # Try with 2 digit year as fallback
-         try:
+        # Try with 2 digit year as fallback
+        try:
             chosen_date = datetime.datetime.strptime(date_text, "%d.%m.%y").date()
-         except ValueError:
+        except ValueError:
             logger.warning(f"Користувач {get_user_log_info(update.effective_user)} ввів некоректний формат дати для перегляду: '{date_input}'")
             today = datetime.date.today() # Поточна дата
             DATE_KEYBOARD=date_keyboard(today, 0, days_ahead)
             await update.message.reply_html(
-                "Невірний формат дати. Будь ласка, введіть дату у форматі <code>ДД.ММ.РР</code> (наприклад, 25.12.25) або скасуйте дію.",
+                "Невірний формат дати. Будь ласка, введіть дату у форматі <code>ДД.ММ.РРРР</code> (наприклад, 25.12.2025) або скасуйте дію.",
                 reply_markup=DATE_KEYBOARD
             )
             return SHOW_GETTING_DATE
@@ -1984,7 +1990,8 @@ async def notify_status(context: ContextTypes.DEFAULT_TYPE) -> None:
     
     # 2. Очищаємо та готуємо дані
     queue_df['Змінено_dt'] = pd.to_datetime(queue_df['Змінено'], format="%d.%m.%Y %H:%M:%S", errors='coerce')
-    queue_df['Змінено_dt'] = queue_df['Змінено_dt'].fillna("01.01.2025 00:00:00")
+    # Використовуємо стару дату (2000 рік), щоб записи без дати зміни не перекривали актуальні записи при сортуванні
+    queue_df['Змінено_dt'] = queue_df['Змінено_dt'].fillna(pd.Timestamp("2000-01-01 00:00:00"))
     #queue_df.dropna(subset=['Дата', 'Примітки', 'Статус', 'Змінено'], inplace=True)
     queue_df.dropna(inplace=True)
     queue_df['TG ID'] = queue_df['TG ID'].astype(str)    
@@ -2065,7 +2072,8 @@ async def date_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     
     # 2. Очищаємо та готуємо дані
     queue_df['Змінено_dt'] = pd.to_datetime(queue_df['Змінено'], format="%d.%m.%Y %H:%M:%S", errors='coerce')
-    queue_df['Змінено_dt'] = queue_df['Змінено_dt'].fillna("01.01.2025 00:00:00")
+    # Використовуємо стару дату (2000 рік), щоб записи без дати зміни не перекривали актуальні записи при сортуванні
+    queue_df['Змінено_dt'] = queue_df['Змінено_dt'].fillna(pd.Timestamp("2000-01-01 00:00:00"))
     queue_df['Дата_dt'] = pd.to_datetime(queue_df['Дата'], format="%d.%m.%Y", errors='coerce').dt.date
     queue_df.dropna(inplace=True)
     queue_df['TG ID'] = queue_df['TG ID'].astype(str)    
