@@ -240,28 +240,28 @@
                 let maxVal = NaN;
                 let minVal = NaN;
 
+                // Parse entered count early for weighting
+                let enteredCount = 0;
+                if (enteredCountStr) {
+                    enteredCount = parseInt(enteredCountStr.replace(/\D/g, ''), 10);
+                }
+                if (isNaN(enteredCount) || enteredCount <= 0) enteredCount = 1;
+
                 // Process Max ID
                 maxVal = parseInt(maxIdStr.replace(/\D/g, ''));
                 if (!isNaN(maxVal)) {
-                    validData.push({ id: maxVal, date, ordinal });
+                    validData.push({ id: maxVal, date, ordinal, count: enteredCount });
                     if (maxVal > maxId) maxId = maxVal;
                 }
 
                 // Process Min ID
                 minVal = parseInt(minIdStr.replace(/\D/g, ''));
                 if (!isNaN(minVal)) {
-                    validData.push({ id: minVal, date, ordinal });
+                    validData.push({ id: minVal, date, ordinal, count: enteredCount });
                 }
 
                 // Store Range for Visualization if both exist
                 if (!isNaN(maxVal) && !isNaN(minVal)) {
-                    // Parse entered count for bar thickness
-                    let enteredCount = 0;
-                    if (enteredCountStr) {
-                        enteredCount = parseInt(enteredCountStr.replace(/\D/g, ''), 10);
-                    }
-                    if (isNaN(enteredCount) || enteredCount <= 0) enteredCount = 1; // Default minimal thickness
-
                     histRanges.push({
                         x: date,
                         y: [minVal, maxVal], // Chart.js bar chart range format
@@ -295,10 +295,26 @@
                 return ord <= cutoffOrdinal;
             });
 
-            // 2. Prepare Regression Input
-            const X = validData.map(d => d.id); // Predictor: Queue ID
-            const Y = validData.map(d => d.ordinal); // Target: Date
-            const n = validData.length;
+            const dailyGroups = new Map();
+            validData.forEach(d => {
+                if (!dailyGroups.has(d.ordinal)) {
+                    dailyGroups.set(d.ordinal, { ids: [], count: d.count });
+                }
+                dailyGroups.get(d.ordinal).ids.push(d.id);
+            });
+
+            const regressionData = Array.from(dailyGroups.entries()).map(([ord, data]) => {
+                // Use average ID for the day for regression
+                const avgId = data.ids.reduce((a, b) => a + b, 0) / data.ids.length;
+                return { ordinal: ord, id: avgId, count: data.count };
+            });
+
+            // Ensure sorted (Map preserves insertion order from sorted validData, but explicit is safer)
+            regressionData.sort((a, b) => a.ordinal - b.ordinal);
+
+            const X = regressionData.map(d => d.id); // Predictor: Queue ID
+            const Y = regressionData.map(d => d.ordinal); // Target: Date
+            const n = regressionData.length;
 
             // Weights: Exponential decay e^(-3) -> e^0
             const weights = [];
