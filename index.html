@@ -219,24 +219,57 @@
 
             // 1. Parse & Filter Data (Historical)
             const validData = [];
+            const histRanges = []; // Store ranges [min, max] per date for visualization
             let maxId = 0;
             let maxDateOrdinal = 0;
 
             data.forEach(row => {
                 const dateStr = row['Дата прийому'];
-                const idStr = row['Останній номер що зайшов'];
-                if (!dateStr || !idStr) return;
+                const maxIdStr = row['Останній номер що зайшов'];
+                const minIdStr = row['Перший номер що зайшов'];
+                const enteredCountStr = row['Зайшов'];
+
+                // Both columns are required
+                if (!dateStr || !maxIdStr || !minIdStr) return;
 
                 const date = parseDate(dateStr);
-                // Remove non-digits to handle "123 (approx)" cases if any
-                const id = parseInt(idStr.replace(/\D/g, '')); 
+                if (!date) return;
+                
+                const ordinal = toOrdinal(date);
+                
+                let maxVal = NaN;
+                let minVal = NaN;
 
-                if (date && !isNaN(id)) {
-                    const ordinal = toOrdinal(date);
-                    validData.push({ id, date, ordinal });
-                    if (id > maxId) maxId = id;
-                    if (ordinal > maxDateOrdinal) maxDateOrdinal = ordinal;
+                // Process Max ID
+                maxVal = parseInt(maxIdStr.replace(/\D/g, ''));
+                if (!isNaN(maxVal)) {
+                    validData.push({ id: maxVal, date, ordinal });
+                    if (maxVal > maxId) maxId = maxVal;
                 }
+
+                // Process Min ID
+                minVal = parseInt(minIdStr.replace(/\D/g, ''));
+                if (!isNaN(minVal)) {
+                    validData.push({ id: minVal, date, ordinal });
+                }
+
+                // Store Range for Visualization if both exist
+                if (!isNaN(maxVal) && !isNaN(minVal)) {
+                    // Parse entered count for bar thickness
+                    let enteredCount = 0;
+                    if (enteredCountStr) {
+                        enteredCount = parseInt(enteredCountStr.replace(/\D/g, ''), 10);
+                    }
+                    if (isNaN(enteredCount) || enteredCount <= 0) enteredCount = 1; // Default minimal thickness
+
+                    histRanges.push({
+                        x: date,
+                        y: [minVal, maxVal], // Chart.js bar chart range format
+                        thickness: enteredCount // Raw count, will scale in chart options
+                    });
+                }
+
+                if (ordinal > maxDateOrdinal) maxDateOrdinal = ordinal;
             });
 
             validData.sort((a, b) => a.ordinal - b.ordinal);
@@ -382,12 +415,46 @@
             const l50Data = filterFuture(predPoints.map(p => ({ x: p.l50, y: p.id })));
             const h50Data = filterFuture(predPoints.map(p => ({ x: p.h50, y: p.id })));
 
-            renderChart(histData, preBookedChartData, meanData, l90Data, h90Data, l50Data, h50Data);
+            renderChart(histData, histRanges, preBookedChartData, meanData, l90Data, h90Data, l50Data, h50Data);
         }
 
-        function renderChart(histData, preBookedData, meanData, l90Data, h90Data, l50Data, h50Data) {
+        function renderChart(histData, histRanges, preBookedData, meanData, l90Data, h90Data, l50Data, h50Data) {
             const ctx = document.getElementById('queueChart').getContext('2d');
             
+            // Custom Plugin for Variable Width Lines
+            const variableWidthLinePlugin = {
+                id: 'variableWidthLine',
+                beforeDatasetsDraw(chart, args, options) {
+                    const { ctx, scales: { x, y } } = chart;
+                    const ranges = options.data || [];
+
+                    ctx.save();
+                    ctx.lineCap = 'butt';
+                    ctx.strokeStyle = 'rgba(0, 0, 0, 0.3)';
+
+                    ranges.forEach(range => {
+                        if (!range.x || !range.y) return;
+
+                        const xPos = x.getPixelForValue(range.x.getTime());
+                        const yMin = y.getPixelForValue(range.y[0]);
+                        const yMax = y.getPixelForValue(range.y[1]);
+                        
+                        // Calculate thickness
+                        // Scale: 0.2px per person, clamped between 2px and 30px
+                        const thickness = Math.max(2, Math.min(range.thickness * 0.2, 30));
+                        
+                        ctx.lineWidth = thickness;
+                        
+                        ctx.beginPath();
+                        ctx.moveTo(xPos, yMin);
+                        ctx.lineTo(xPos, yMax);
+                        ctx.stroke();
+                    });
+
+                    ctx.restore();
+                }
+            };
+
             // Helper to freeze chart at a specific ID
             // Defined here to access the data arrays via closure
             const freezeAtId = (chart, targetId) => {
@@ -443,7 +510,6 @@
                 }
             };
 
-            // Custom Plugin for Freeze Behavior
             const freezePlugin = {
                 id: 'freezeTooltip',
                 defaults: {
@@ -728,6 +794,9 @@
                         }
                     },
                     plugins: {
+                        variableWidthLine: {
+                            data: histRanges
+                        },
                         legend: {
                             // Only show Hist and Mean
                             labels: {
@@ -812,7 +881,7 @@
                             ctx.restore();
                         }
                     }
-                }, freezePlugin]
+                }, freezePlugin, variableWidthLinePlugin]
             });
         }
     </script>
