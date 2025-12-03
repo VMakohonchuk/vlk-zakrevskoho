@@ -173,7 +173,7 @@
             document.getElementById('error').textContent = "Failed to load data: " + err.message;
         });
 
-        function processAndRender(data, historicalData) {
+        function processAndRender(statsData, historicalData) {
             let globalMaxId = 0;
             const preBookedData = [];
 
@@ -194,13 +194,6 @@
                 }
             });
             
-            // If globalMaxId is suspiciously high (like 48000), we might have parsed a phone number or bad data?
-            // User said "actual max is around 5100, not 48k". 
-            // Let's add a sanity filter: ID must be < 20000? 
-            // Or just trust the regex ^\d+$ which excludes "48k".
-            // The issue might have been row index confusion or a stray value.
-            // With /^\d+$/ check, we should be safer.
-            
             // Add buffer (100)
             const targetEndId = globalMaxId > 0 ? globalMaxId + 100 : 5500;
 
@@ -210,7 +203,7 @@
             let maxId = 0;
             let maxDateOrdinal = 0;
 
-            data.forEach(row => {
+            statsData.forEach(row => {
                 const dateStr = row['Дата прийому'];
                 const maxIdStr = row['Останній номер що зайшов'];
                 const minIdStr = row['Перший номер що зайшов'];
