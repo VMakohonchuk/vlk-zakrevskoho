@@ -53,8 +53,15 @@ def download_stats(sheets_service, stats_sheet_id, stats_worksheet_name):
         logger.error(f"Помилка завантаження stats: {e}")
         return None
 
-def download_daily_sheet(sheets_service, stats_sheet_id, sheet_name):
-    """Завантажує один щоденний аркуш за назвою."""
+def download_daily_sheet(sheets_service, stats_sheet_id, sheet_name, retry_delay=0.5):
+    """
+    Завантажує один щоденний аркуш за назвою.
+    
+    Args:
+        retry_delay: Затримка в секундах при rate limit (429)
+    """
+    import time
+    
     try:
         date_obj = datetime.datetime.strptime(sheet_name, "%d.%m.%Y").date()
         cache_filename = date_obj.strftime("%Y-%m-%d.csv")
@@ -64,34 +71,56 @@ def download_daily_sheet(sheets_service, stats_sheet_id, sheet_name):
     
     cache_file = os.path.join(DAILY_SHEETS_CACHE_DIR, cache_filename)
     
-    try:
-        range_name = f"{sheet_name}!A:Z"
-        result = sheets_service.spreadsheets().values().get(
-            spreadsheetId=stats_sheet_id,
-            range=range_name
-        ).execute()
-        
-        values = result.get('values', [])
-        
-        if not values:
-            logger.warning(f"Аркуш {sheet_name} порожній")
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            range_name = f"{sheet_name}!A:Z"
+            result = sheets_service.spreadsheets().values().get(
+                spreadsheetId=stats_sheet_id,
+                range=range_name
+            ).execute()
+            
+            values = result.get('values', [])
+            
+            if not values:
+                logger.warning(f"Аркуш {sheet_name} порожній")
+                return False
+            
+            with open(cache_file, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                for row in values:
+                    writer.writerow(row)
+            
+            logger.debug(f"Завантажено {sheet_name} -> {cache_filename}")
+            return True
+            
+        except HttpError as err:
+            if err.resp.status == 429:
+                if attempt < max_retries - 1:
+                    wait_time = retry_delay * (2 ** attempt)
+                    logger.warning(f"Rate limit для {sheet_name}, чекаю {wait_time}s...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    logger.error(f"Rate limit для {sheet_name} після {max_retries} спроб")
+                    return False
+            elif err.resp.status != 400:
+                logger.error(f"HTTP помилка для {sheet_name}: {err.resp.status}")
             return False
-        
-        with open(cache_file, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            for row in values:
-                writer.writerow(row)
-        
-        logger.debug(f"Завантажено {sheet_name} -> {cache_filename}")
-        return True
-        
-    except HttpError as err:
-        if err.resp.status != 400:
-            logger.error(f"HTTP помилка для {sheet_name}: {err.resp.status}")
-        return False
-    except Exception as e:
-        logger.error(f"Помилка завантаження {sheet_name}: {e}")
-        return False
+        except (ConnectionError, BrokenPipeError, OSError) as e:
+            if attempt < max_retries - 1:
+                wait_time = retry_delay * (2 ** attempt)
+                logger.warning(f"Мережева помилка для {sheet_name} ({type(e).__name__}), чекаю {wait_time}s...")
+                time.sleep(wait_time)
+                continue
+            else:
+                logger.error(f"Мережева помилка для {sheet_name} після {max_retries} спроб: {e}")
+                return False
+        except Exception as e:
+            logger.error(f"Невідома помилка завантаження {sheet_name}: {e}")
+            return False
+    
+    return False
 
 def sync_daily_sheets(sheets_service, stats_sheet_id, stats_worksheet_name, force_refresh_stats=False, force_refresh_all_sheets=False):
     """
@@ -176,10 +205,15 @@ def sync_daily_sheets(sheets_service, stats_sheet_id, stats_worksheet_name, forc
     
     sheets_updated = False
     if sheets_to_update:
+        import time
         logger.info(f"Завантаження {len(sheets_to_update)} аркушів (включно з оновленням останніх {REFRESH_LAST_N_DAYS} днів)...")
-        for sheet_name in sheets_to_update:
+        for i, sheet_name in enumerate(sheets_to_update):
             if download_daily_sheet(sheets_service, stats_sheet_id, sheet_name):
                 sheets_updated = True
+            
+            # Затримка між запитами для уникнення rate limit (крім останнього)
+            if i < len(sheets_to_update) - 1:
+                time.sleep(0.3)  # 300ms між запитами
     
     # Якщо були оновлення або force_refresh_stats, регенеруємо attendance_data.json
     if sheets_updated or should_refresh:
