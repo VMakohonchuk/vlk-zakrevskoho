@@ -4,6 +4,12 @@ on:
   schedule:
     - cron: '0 * * * *'  # на початку кожної години
   workflow_dispatch:  # Можна запустити вручну
+    inputs:
+      force_all:
+        description: 'Перезавантажити всі аркуші (ігнорувати кеш)'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -31,7 +37,12 @@ jobs:
         run: echo '${{ secrets.SERVICE_ACCOUNT_KEY }}' > service_account_key.json
       
       - name: Sync daily sheets and generate JSON
-        run: python sync_for_github_actions.py
+        run: |
+          if [ "${{ github.event.inputs.force_all }}" = "true" ]; then
+            python sync_for_github_actions.py --force-all
+          else
+            python sync_for_github_actions.py
+          fi
       
       - name: Clean up credentials
         if: always()
