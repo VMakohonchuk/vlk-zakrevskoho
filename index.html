@@ -42,19 +42,6 @@
         <strong>Примітки:</strong><br>
         • Попередні записи на дати > 3 місяців від останньої історичної дати не відображаються
     </div>
-    <script>
-        // Оновлюємо лічильник після завантаження
-        window.addEventListener('load', () => {
-            fetch('attendance_data.json')
-                .then(r => r.json())
-                .then(data => {
-                    document.getElementById('dataPointsCount').textContent = data.total_points;
-                })
-                .catch(() => {
-                    document.getElementById('dataPointsCount').textContent = 'невідомо';
-                });
-        });
-    </script>
 
     <script type="module">
         import { parse } from 'https://cdn.jsdelivr.net/npm/csv-parse@5.5.3/+esm';
@@ -211,7 +198,6 @@
 
         function processAndRender(attendanceData, historicalData) {
             console.log(`Завантажено ${attendanceData.total_points} точок відвідуваності`);
-            console.log(`Дані згенеровані: ${attendanceData.generated_at}`);
             
             let globalMaxId = 0;
             const preBookedData = [];

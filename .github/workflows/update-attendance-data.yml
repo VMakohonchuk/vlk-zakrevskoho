@@ -2,7 +2,7 @@ name: Update Attendance Data
 
 on:
   schedule:
-    - cron: '0 3 * * *'  # Щодня о 3:00 UTC (5:00 за київським часом)
+    - cron: '0 * * * *'  # на початку кожної години
   workflow_dispatch:  # Можна запустити вручну
 
 permissions:

@@ -93,10 +93,20 @@ def download_daily_sheet(sheets_service, stats_sheet_id, sheet_name):
         logger.error(f"Помилка завантаження {sheet_name}: {e}")
         return False
 
-def sync_daily_sheets(sheets_service, stats_sheet_id, stats_worksheet_name, force_refresh_stats=False):
+def sync_daily_sheets(sheets_service, stats_sheet_id, stats_worksheet_name, force_refresh_stats=False, force_refresh_all_sheets=False):
     """
     Синхронізує щоденні аркуші на основі колонки "Аркуш" зі stats.
     Оновлює stats якщо він застарів або force_refresh_stats=True.
+    
+    ВАЖЛИВО: Завжди перезавантажує останні 5 днів, щоб захопити оновлення
+    які адміністратори могли внести протягом дня після попередньої синхронізації.
+    
+    Args:
+        sheets_service: Google Sheets API service
+        stats_sheet_id: ID таблиці Stats
+        stats_worksheet_name: Назва worksheet зі статистикою
+        force_refresh_stats: Примусово оновити stats (ігнорувати кеш)
+        force_refresh_all_sheets: Примусово перезавантажити ВСІ щоденні аркуші
     """
     ensure_cache_dir()
     
@@ -137,23 +147,37 @@ def sync_daily_sheets(sheets_service, stats_sheet_id, stats_worksheet_name, forc
             except ValueError:
                 continue
     
-    # Перевіряємо які вже є
-    existing_sheets = set()
-    for filename in os.listdir(DAILY_SHEETS_CACHE_DIR):
-        if filename.endswith('.csv') and filename != '_stats.csv':
-            try:
-                date_obj = datetime.datetime.strptime(filename[:-4], "%Y-%m-%d").date()
-                sheet_name = date_obj.strftime("%d.%m.%Y")
-                existing_sheets.add(sheet_name)
-            except:
-                continue
+    # Визначаємо які аркуші потрібно (пере)завантажити
+    # Завжди перезавантажуємо останні N днів (можуть бути оновлені адміністратором)
+    REFRESH_LAST_N_DAYS = 5
     
-    missing_sheets = [s for s in sheets_to_download if s not in existing_sheets]
+    if force_refresh_all_sheets:
+        # Режим повного перезавантаження - ігноруємо кеш
+        logger.info("Режим force_refresh_all_sheets: ігнорування кешу для всіх аркушів")
+        sheets_to_update = sheets_to_download
+    else:
+        cutoff_date = datetime.date.today() - datetime.timedelta(days=REFRESH_LAST_N_DAYS)
+        
+        existing_sheets = set()
+        for filename in os.listdir(DAILY_SHEETS_CACHE_DIR):
+            if filename.endswith('.csv') and filename != '_stats.csv':
+                try:
+                    date_obj = datetime.datetime.strptime(filename[:-4], "%Y-%m-%d").date()
+                    sheet_name = date_obj.strftime("%d.%m.%Y")
+                    
+                    # Додаємо тільки старі аркуші (які НЕ будемо оновлювати)
+                    if date_obj < cutoff_date:
+                        existing_sheets.add(sheet_name)
+                except:
+                    continue
+        
+        # Аркуші які відсутні АБО в межах останніх N днів
+        sheets_to_update = [s for s in sheets_to_download if s not in existing_sheets]
     
     sheets_updated = False
-    if missing_sheets:
-        logger.info(f"Завантаження {len(missing_sheets)} відсутніх аркушів...")
-        for sheet_name in missing_sheets:
+    if sheets_to_update:
+        logger.info(f"Завантаження {len(sheets_to_update)} аркушів (включно з оновленням останніх {REFRESH_LAST_N_DAYS} днів)...")
+        for sheet_name in sheets_to_update:
             if download_daily_sheet(sheets_service, stats_sheet_id, sheet_name):
                 sheets_updated = True
     
@@ -444,7 +468,6 @@ def generate_attendance_json(output_file='attendance_data.json'):
         with open(output_file, 'w', encoding='utf-8') as f:
             json.dump({
                 'attendance_points': attendance_points,
-                'generated_at': datetime.datetime.now().isoformat(),
                 'total_points': len(attendance_points)
             }, f, ensure_ascii=False, indent=2)
         
