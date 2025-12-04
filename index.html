@@ -39,30 +39,47 @@
     </div>
     
     <div style="margin-top: 10px; font-style: italic; color: #666; font-size: 0.9em;">
-        Примітка: Попередні записи на дати, що віддалені більш ніж на 3 місяці від поточної дати, на графіку не відображаються.
+        <strong>Примітки:</strong><br>
+        • Попередні записи на дати > 3 місяців від останньої історичної дати не відображаються
     </div>
+    <script>
+        // Оновлюємо лічильник після завантаження
+        window.addEventListener('load', () => {
+            fetch('attendance_data.json')
+                .then(r => r.json())
+                .then(data => {
+                    document.getElementById('dataPointsCount').textContent = data.total_points;
+                })
+                .catch(() => {
+                    document.getElementById('dataPointsCount').textContent = 'невідомо';
+                });
+        });
+    </script>
 
     <script type="module">
         import { parse } from 'https://cdn.jsdelivr.net/npm/csv-parse@5.5.3/+esm';
         
-        // Google Sheet CSV URL
+        // Google Sheet CSV URL for pre-booked data
         const SHEET_ID = '1d9OG-0b7wxxqrOujC9v6ikhjMKL2ei3wfrfaG61zSjA';
-        const STATS_SHEET = '822507513';
         const HISTORICAL_DATA_SHEET = '84071606';
         
-        const statsUrl = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&gid=${STATS_SHEET}`;
         const historicalDataUrl = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&gid=${HISTORICAL_DATA_SHEET}`;
 
         const isLocalhost = window.location.hostname === 'localhost' || 
                             window.location.hostname === '127.0.0.1' ||
                             window.location.protocol === 'file:';
 
-        const STATS_URL = isLocalhost 
-            ? 'https://corsproxy.io/?' + encodeURIComponent(statsUrl) 
-            : statsUrl;
+        // Attendance data from daily sheets
+        const ATTENDANCE_DATA_URL = 'attendance_data.json';
+        
         const HISTORICAL_DATA_URL = isLocalhost 
             ? 'https://corsproxy.io/?' + encodeURIComponent(historicalDataUrl) 
             : historicalDataUrl;
+
+        // --- Константи налаштування прогнозної моделі ---
+        const WEIGHT_EXP_MIN = -3;  // Мінімальна експонента ваги (для найстаріших точок)
+        const WEIGHT_EXP_MAX = 1;   // Максимальна експонента ваги (для найновіших точок)
+        const LIVE_QUEUE_WEIGHT = 0; // Вага для живої черги (0 = виключити з розрахунків)
 
         // --- Helper Functions ---
         function fetchAndParse(url) {
@@ -163,150 +180,164 @@
 
         // --- Data Processing & Charting ---
 
-        Promise.all([
-            fetchAndParse(STATS_URL),
-            fetchAndParse(HISTORICAL_DATA_URL)
-        ]).then(([statsData, historicalData]) => {
-            document.getElementById('loading').style.display = 'none';
-            try {
-                processAndRender(statsData, historicalData);
-            } catch (e) {
-                console.error(e);
-                document.getElementById('error').textContent = "Error: " + e.message;
-            }
-        }).catch(err => {
-            document.getElementById('loading').style.display = 'none';
-            document.getElementById('error').textContent = "Failed to load data: " + err.message;
-        });
+        let chartInstance = null;
 
-        function processAndRender(statsData, historicalData) {
+        fetch(ATTENDANCE_DATA_URL)
+            .then(r => r.json())
+            .then(attendanceData => {
+                document.getElementById('loading').textContent = 'Завантаження даних попередніх записів...';
+                try {
+                    chartInstance = processAndRender(attendanceData, null);
+                } catch (e) {
+                    console.error(e);
+                    document.getElementById('error').textContent = "Error: " + e.message;
+                }
+                
+                return fetchAndParse(HISTORICAL_DATA_URL);
+            })
+            .then(historicalData => {
+                document.getElementById('loading').style.display = 'none';
+                try {
+                    updateChartWithPreBookedData(chartInstance, historicalData);
+                } catch (e) {
+                    console.error(e);
+                    document.getElementById('error').textContent = "Error updating pre-booked data: " + e.message;
+                }
+            })
+            .catch(err => {
+                document.getElementById('loading').style.display = 'none';
+                document.getElementById('error').textContent = "Failed to load data: " + err.message;
+            });
+
+        function processAndRender(attendanceData, historicalData) {
+            console.log(`Завантажено ${attendanceData.total_points} точок відвідуваності`);
+            console.log(`Дані згенеровані: ${attendanceData.generated_at}`);
+            
             let globalMaxId = 0;
             const preBookedData = [];
 
-            historicalData.forEach(row => {
-                const idStr = String(row['ID'] || '').trim();
-                const dateStr = String(row['Дата'] || '').trim();
-                
-                if (!/^\d+$/.test(idStr)) return; 
-                
-                const id = parseInt(idStr, 10);
-                if (isNaN(id)) return;
+            // Обробка даних попередніх записів (якщо вони доступні)
+            if (historicalData) {
+                historicalData.forEach(row => {
+                    const idStr = String(row['ID'] || '').trim();
+                    const dateStr = String(row['Дата'] || '').trim();
+                    
+                    if (!/^\d+$/.test(idStr)) return; 
+                    
+                    const id = parseInt(idStr, 10);
+                    if (isNaN(id)) return;
 
-                if (id > globalMaxId) globalMaxId = id;
+                    if (id > globalMaxId) globalMaxId = id;
 
-                const date = parseDate(dateStr);
-                if (date) {
-                    preBookedData.push({ id: id, date: date });
-                }
-            });
+                    const date = parseDate(dateStr);
+                    if (date) {
+                        preBookedData.push({ id: id, date: date });
+                    }
+                });
+            }
             
-            // Add buffer (100)
-            const targetEndId = globalMaxId > 0 ? globalMaxId + 100 : 5500;
-
-            // 1. Parse & Filter Data (Historical)
-            const validData = [];
-            const histRanges = []; // Store ranges [min, max] per date for visualization
+            // Обробка даних фактичної відвідуваності з щоденних аркушів
+            const allAttendancePoints = [];
+            const liveQueuePoints = [];
+            const regularPoints = [];
             let maxId = 0;
             let maxDateOrdinal = 0;
-
-            statsData.forEach(row => {
-                const dateStr = row['Дата прийому'];
-                const maxIdStr = row['Останній номер що зайшов'];
-                const minIdStr = row['Перший номер що зайшов'];
-                const enteredCountStr = row['Зайшов'];
-
-                // Both columns are required
-                if (!dateStr || !maxIdStr || !minIdStr) return;
-
-                const date = parseDate(dateStr);
-                if (!date) return;
-                
+            let minDateOrdinal = Infinity;
+            
+            // Групуємо дані за датами для візуалізації діапазонів
+            const dailyRanges = new Map();
+            
+            attendanceData.attendance_points.forEach(point => {
+                const id = point.id;
+                const date = new Date(point.date + 'T12:00:00');
                 const ordinal = toOrdinal(date);
+                const isLive = point.is_live || false;
                 
-                let maxVal = NaN;
-                let minVal = NaN;
-
-                // Parse entered count early for weighting
-                let enteredCount = 0;
-                if (enteredCountStr) {
-                    enteredCount = parseInt(enteredCountStr.replace(/\D/g, ''), 10);
+                const pointData = { id, date, ordinal, isLive };
+                allAttendancePoints.push(pointData);
+                
+                // Розділяємо на живу чергу та регулярну
+                if (isLive) {
+                    liveQueuePoints.push({ x: date, y: id });
+                } else {
+                    regularPoints.push({ x: date, y: id });
                 }
-                if (isNaN(enteredCount) || enteredCount <= 0) enteredCount = 1;
-
-                // Process Max ID
-                maxVal = parseInt(maxIdStr.replace(/\D/g, ''));
-                if (!isNaN(maxVal)) {
-                    validData.push({ id: maxVal, date, ordinal, count: enteredCount });
-                    if (maxVal > maxId) maxId = maxVal;
+                
+                if (id > maxId) maxId = id;
+                if (ordinal > maxDateOrdinal) maxDateOrdinal = ordinal;
+                if (ordinal < minDateOrdinal) minDateOrdinal = ordinal;
+                
+                // Додаємо до групи для обчислення діапазону
+                if (!dailyRanges.has(point.date)) {
+                    dailyRanges.set(point.date, { ids: [], date: date });
                 }
-
-                // Process Min ID
-                minVal = parseInt(minIdStr.replace(/\D/g, ''));
-                if (!isNaN(minVal)) {
-                    validData.push({ id: minVal, date, ordinal, count: enteredCount });
-                }
-
-                // Store Range for Visualization if both exist
-                if (!isNaN(maxVal) && !isNaN(minVal)) {
+                dailyRanges.get(point.date).ids.push(id);
+            });
+            
+            // Створюємо діапазони для візуалізації
+            const histRanges = [];
+            dailyRanges.forEach((data, dateStr) => {
+                const ids = data.ids;
+                if (ids.length > 0) {
                     histRanges.push({
-                        x: date,
-                        y: [minVal, maxVal], // Chart.js bar chart range format
-                        thickness: enteredCount // Raw count, will scale in chart options
+                        x: data.date,
+                        y: [Math.min(...ids), Math.max(...ids)],
+                        thickness: ids.length
                     });
                 }
-
-                if (ordinal > maxDateOrdinal) maxDateOrdinal = ordinal;
             });
-
-            validData.sort((a, b) => a.ordinal - b.ordinal);
-
-            if (validData.length === 0) throw new Error("Дійсних даних не знайдено.");
-
-            // Filter Pre-booked Data outliers (> 3 months from last historical date)
-            const lastHistoricalDateOrdinal = validData[validData.length - 1].ordinal;
-            // 3 months is approx 65 business days (21.6 working days/month * 3)
-            const cutoffOrdinal = lastHistoricalDateOrdinal + 65; 
             
-            // Filter in place or create new array
-            // We need to filter preBookedData which was passed in
-            // However, preBookedData is an array of objects {id, date} (JS Date objects)
-            
-            // Let's convert cutoff to JS Date timestamp comparison for simplicity or re-calculate ordinal
-            // The ordinal helper is simple: day count.
+            // Додаємо буфер
+            const targetEndId = Math.max(globalMaxId, maxId) + 100;
+
+            if (allAttendancePoints.length === 0) throw new Error("Дійсних даних не знайдено.");
+
+            // Фільтрація попередніх записів (> 3 місяці від останньої історичної дати)
+            const lastHistoricalDateOrdinal = maxDateOrdinal;
+            const cutoffOrdinal = lastHistoricalDateOrdinal + 65; // 3 місяці ≈ 65 робочих днів
             
             const filteredPreBookedData = preBookedData.filter(d => {
                 const ord = toOrdinal(d.date);
-                // Filter if date is way too far in future (outlier)
-                // e.g. > 3 months from last known processed date
                 return ord <= cutoffOrdinal;
             });
 
-            const dailyGroups = new Map();
-            validData.forEach(d => {
-                if (!dailyGroups.has(d.ordinal)) {
-                    dailyGroups.set(d.ordinal, { ids: [], count: d.count });
+            // Групуємо точки відвідуваності за ID для регресії
+            // Якщо ID відвідав кілька разів, беремо середню дату
+            const idGroups = new Map();
+            allAttendancePoints.forEach(point => {
+                if (!idGroups.has(point.id)) {
+                    idGroups.set(point.id, { ordinals: [], isLive: false });
                 }
-                dailyGroups.get(d.ordinal).ids.push(d.id);
+                idGroups.get(point.id).ordinals.push(point.ordinal);
+                // Якщо хоча б одне відвідування було за живою чергою, маркуємо ID
+                if (point.isLive) {
+                    idGroups.get(point.id).isLive = true;
+                }
             });
-
-            const regressionData = Array.from(dailyGroups.entries()).map(([ord, data]) => {
-                // Use average ID for the day for regression
-                const avgId = data.ids.reduce((a, b) => a + b, 0) / data.ids.length;
-                return { ordinal: ord, id: avgId, count: data.count };
+            
+            const regressionData = Array.from(idGroups.entries()).map(([id, data]) => {
+                const avgOrdinal = data.ordinals.reduce((a, b) => a + b, 0) / data.ordinals.length;
+                return { id: id, ordinal: avgOrdinal, isLive: data.isLive };
             });
+            
+            regressionData.sort((a, b) => a.id - b.id);
 
-            // Ensure sorted (Map preserves insertion order from sorted validData, but explicit is safer)
-            regressionData.sort((a, b) => a.ordinal - b.ordinal);
-
-            const X = regressionData.map(d => d.id); // Predictor: Queue ID
-            const Y = regressionData.map(d => d.ordinal); // Target: Date
+            const X = regressionData.map(d => d.id); // Предиктор: ID черги
+            const Y = regressionData.map(d => d.ordinal); // Цільова змінна: Дата
             const n = regressionData.length;
 
-            // Weights: Exponential decay e^(-3) -> e^0
+            // Ваги: експоненційне затухання + зменшена вага для живої черги
             const weights = [];
             for (let i = 0; i < n; i++) {
-                const val = -3 + (i / (n - 1)) * 3;
-                weights.push(Math.exp(val));
+                const val = WEIGHT_EXP_MIN + (i / (n - 1)) * (WEIGHT_EXP_MAX - WEIGHT_EXP_MIN);
+                let weight = Math.exp(val);
+                
+                // Зменшуємо вагу для точок живої черги
+                if (regressionData[i].isLive) {
+                    weight *= LIVE_QUEUE_WEIGHT;
+                }
+                
+                weights.push(weight);
             }
 
             // 3. Train Model
@@ -345,7 +376,9 @@
             // We want to plot Queue ID on Y axis, Date on X axis.
             // Chart.js Scatter: x=Date, y=ID
             
-            const startId = maxId;
+            // Генеруємо для всього діапазону ID (від мінімального до максимального + буфер)
+            const minHistoricalId = Math.min(...regressionData.map(d => d.id));
+            const startId = minHistoricalId;
             const endId = targetEndId; 
             const minFeasibleOrdinal = maxDateOrdinal + 1; // Next day after last history
 
@@ -368,13 +401,6 @@
                 let l50 = predOrd - margin50;
                 let h50 = predOrd + margin50;
 
-                // Logic Clamp: Future predictions cannot be in the past
-                if (qId > maxId) {
-                    if (predOrd < minFeasibleOrdinal) predOrd = minFeasibleOrdinal;
-                    if (l90 < minFeasibleOrdinal) l90 = minFeasibleOrdinal;
-                    if (l50 < minFeasibleOrdinal) l50 = minFeasibleOrdinal;
-                }
-
                 // Sort bounds
                 if (l90 > predOrd) l90 = predOrd;
                 if (h90 < predOrd) h90 = predOrd;
@@ -393,35 +419,67 @@
 
             // 6. Chart.js Data Structure
             
-            // Historical Points
-            const histData = validData.map(d => ({ x: d.date, y: d.id }));
+            // Визначаємо останню історичну дату
+            const lastHistoricalDate = fromOrdinal(maxDateOrdinal);
             
-            // Determine last historical date for filtering
-            const lastHistoricalDate = validData[validData.length - 1].date;
-            const lastHistoricalTime = lastHistoricalDate.getTime();
+            // Знаходимо наступний робочий день після останньої історичної дати
+            let nextWorkingDate = new Date(lastHistoricalDate);
+            nextWorkingDate.setDate(nextWorkingDate.getDate() + 1);
+            
+            // Пропускаємо вихідні (5 = субота, 6 = неділя)
+            while (nextWorkingDate.getDay() === 0 || nextWorkingDate.getDay() === 6) {
+                nextWorkingDate.setDate(nextWorkingDate.getDate() + 1);
+            }
+            
+            const nextWorkingTime = nextWorkingDate.getTime();
+            
+            // Визначаємо найранішу історичну дату
+            const earliestHistoricalDate = fromOrdinal(minDateOrdinal);
+            const earliestHistoricalTime = earliestHistoricalDate.getTime();
 
             // Pre-booked Points (From second sheet, filtered)
             const preBookedChartData = filteredPreBookedData.map(d => ({ x: d.date, y: d.id }));
 
-            // Helper to filter out points in the past (relative to history)
-            const filterFuture = (arr) => arr.filter(p => p.x.getTime() >= lastHistoricalTime);
-
-            // Mean Line
-            const meanData = filterFuture(predPoints.map(p => ({ x: p.mean, y: p.id })));
+            // Створюємо повні дані для freezeAtId
+            const allMeanData = predPoints.map(p => ({ x: p.mean, y: p.id }));
+            const allL90Data = predPoints.map(p => ({ x: p.l90, y: p.id }));
+            const allH90Data = predPoints.map(p => ({ x: p.h90, y: p.id }));
+            const allL50Data = predPoints.map(p => ({ x: p.l50, y: p.id }));
+            const allH50Data = predPoints.map(p => ({ x: p.h50, y: p.id }));
             
-            // Confidence Intervals
-            // We filter them to ensure they don't show "past" predictions
-            
-            const l90Data = filterFuture(predPoints.map(p => ({ x: p.l90, y: p.id })));
-            const h90Data = filterFuture(predPoints.map(p => ({ x: p.h90, y: p.id })));
-            const l50Data = filterFuture(predPoints.map(p => ({ x: p.l50, y: p.id })));
-            const h50Data = filterFuture(predPoints.map(p => ({ x: p.h50, y: p.id })));
+            // Фільтруємо прогнозні лінії: інтервали від наступного робочого дня, mean від найранішої дати
+            const filterFutureOnly = (arr) => arr.filter(p => p.x.getTime() >= nextWorkingTime);
+            const filterFromEarliest = (arr) => arr.filter(p => p.x.getTime() >= earliestHistoricalTime);
 
-            renderChart(histData, histRanges, preBookedChartData, meanData, l90Data, h90Data, l50Data, h50Data);
+            const meanData = filterFromEarliest(allMeanData);
+            const l90Data = filterFutureOnly(allL90Data);
+            const h90Data = filterFutureOnly(allH90Data);
+            const l50Data = filterFutureOnly(allL50Data);
+            const h50Data = filterFutureOnly(allH50Data);
+
+            const chart = renderChart(regularPoints, liveQueuePoints, histRanges, preBookedChartData, 
+                meanData, l90Data, h90Data, l50Data, h50Data,
+                allMeanData, allL90Data, allH90Data, allL50Data, allH50Data);
+            
+            return {
+                chart,
+                maxId,
+                maxDateOrdinal,
+                allMeanData,
+                allL90Data,
+                allH90Data,
+                allL50Data,
+                allH50Data
+            };
         }
 
-        function renderChart(histData, histRanges, preBookedData, meanData, l90Data, h90Data, l50Data, h50Data) {
+        function renderChart(regularPoints, liveQueuePoints, histRanges, preBookedData, 
+                             meanData, l90Data, h90Data, l50Data, h50Data,
+                             allMeanData, allL90Data, allH90Data, allL50Data, allH50Data) {
             const ctx = document.getElementById('queueChart').getContext('2d');
+            
+            // Об'єднуємо для зворотної сумісності з freezeAtId
+            const histData = [...regularPoints, ...liveQueuePoints];
             
             // Custom Plugin for Variable Width Lines
             const variableWidthLinePlugin = {
@@ -460,13 +518,18 @@
             // Helper to freeze chart at a specific ID
             // Defined here to access the data arrays via closure
             const freezeAtId = (chart, targetId) => {
-                // Find nearest point in meanData
-                const nearest = meanData.reduce((prev, curr) => 
+                // Find nearest point in allMeanData (unfiltered)
+                if (!allMeanData || allMeanData.length === 0) {
+                    console.error('allMeanData is empty');
+                    return;
+                }
+                
+                const nearest = allMeanData.reduce((prev, curr) => 
                     Math.abs(curr.y - targetId) < Math.abs(prev.y - targetId) ? curr : prev
                 );
                 
                 // Find matching bounds index
-                const idx = meanData.indexOf(nearest);
+                const idx = allMeanData.indexOf(nearest);
                 
                 // Check if this ID exists in Historical or Pre-booked data
                 let actualDate = null;
@@ -478,11 +541,14 @@
                     actualDate = histMatch.x;
                     actualType = 'Історична дата';
                 } else {
-                    // Check Pre-booked
-                    const preBookedMatch = preBookedData.find(d => d.y === targetId);
-                    if (preBookedMatch) {
-                        actualDate = preBookedMatch.x;
-                        actualType = 'Запис на';
+                    // Check Pre-booked - read from chart dataset to get current data
+                    const preBookedDataset = chart.data.datasets.find(ds => ds.label === 'Попередньо записані');
+                    if (preBookedDataset && preBookedDataset.data) {
+                        const preBookedMatch = preBookedDataset.data.find(d => d.y === targetId);
+                        if (preBookedMatch) {
+                            actualDate = preBookedMatch.x;
+                            actualType = 'Запис на';
+                        }
                     }
                 }
                 
@@ -493,10 +559,10 @@
                     chart.frozenData = {
                         id: nearest.y,
                         mean: nearest.x,
-                        l90: l90Data[idx].x,
-                        h90: h90Data[idx].x,
-                        l50: l50Data[idx].x,
-                        h50: h50Data[idx].x,
+                        l90: allL90Data[idx].x,
+                        h90: allH90Data[idx].x,
+                        l50: allL50Data[idx].x,
+                        h50: allH50Data[idx].x,
                         actualDate: actualDate,
                         actualType: actualType
                     };
@@ -559,8 +625,8 @@
                         const val = parseInt(idParam, 10);
                         if (!isNaN(val)) {
                             input.value = val;
-                            // Use setTimeout to ensure chart is ready
-                            setTimeout(() => freezeAtId(chart, val), 0);
+                            // Store the pending freeze ID, will be executed after pre-booked data loads
+                            chart.pendingFreezeId = val;
                         }
                     }
                     
@@ -711,15 +777,22 @@
                 };
             };
 
-            new Chart(ctx, {
+            const chart = new Chart(ctx, {
                 type: 'scatter',
                 data: {
                     datasets: [
                         {
-                            label: 'Історичні дані',
-                            data: histData,
-                            backgroundColor: 'rgba(0, 0, 0, 0.6)',
-                            pointRadius: 3,
+                            label: 'Зайшли',
+                            data: regularPoints,
+                            backgroundColor: 'rgba(0, 0, 0, 0.5)',
+                            pointRadius: 2,
+                            order: 2
+                        },
+                        {
+                            label: 'Зайшли по живій черзі',
+                            data: liveQueuePoints,
+                            backgroundColor: 'rgba(34, 139, 34, 0.8)', // Forest Green
+                            pointRadius: 2,
                             order: 1
                         },
                         {
@@ -728,7 +801,7 @@
                             backgroundColor: 'rgba(255, 165, 0, 0.8)', // Solid Orange
                             borderColor: 'rgba(255, 140, 0, 1)',
                             borderWidth: 1,
-                            pointRadius: 4,
+                            pointRadius: 3,
                             pointStyle: 'rectRot', 
                             order: 0 // Topmost layer
                         },
@@ -847,8 +920,8 @@
                                 },
                                 label: function(context) {
                                     // Custom tooltip formatting if needed
-                                    if (context.dataset.label === 'Історичні дані') {
-                                        return `ID: ${context.raw.y}, Дата: ${context.raw.x.toISOString().split('T')[0]}`;
+                                    if (context.dataset.label === 'Фактична відвідуваність') {
+                                        return `ID: ${context.raw.y}, Дата візиту: ${context.raw.x.toISOString().split('T')[0]}`;
                                     }
                                     // Use YYYY-MM-DD format
                                     return `${context.dataset.label}: ${context.raw.x.toISOString().split('T')[0]}`;
@@ -885,6 +958,63 @@
                     }
                 }, freezePlugin, variableWidthLinePlugin]
             });
+            
+            // Store freezeAtId function on chart for later access
+            chart.freezeAtId = freezeAtId;
+            
+            return chart;
+        }
+
+        function updateChartWithPreBookedData(chartData, historicalData) {
+            if (!chartData || !chartData.chart || !historicalData) return;
+
+            const chart = chartData.chart;
+            const maxId = chartData.maxId;
+            const maxDateOrdinal = chartData.maxDateOrdinal;
+            
+            let globalMaxId = maxId;
+            const preBookedData = [];
+
+            historicalData.forEach(row => {
+                const idStr = String(row['ID'] || '').trim();
+                const dateStr = String(row['Дата'] || '').trim();
+                
+                if (!/^\d+$/.test(idStr)) return; 
+                
+                const id = parseInt(idStr, 10);
+                if (isNaN(id)) return;
+
+                if (id > globalMaxId) globalMaxId = id;
+
+                const date = parseDate(dateStr);
+                if (date) {
+                    preBookedData.push({ id: id, date: date });
+                }
+            });
+
+            const lastHistoricalDateOrdinal = maxDateOrdinal;
+            const cutoffOrdinal = lastHistoricalDateOrdinal + 65;
+            
+            const filteredPreBookedData = preBookedData.filter(d => {
+                const ord = toOrdinal(d.date);
+                return ord <= cutoffOrdinal;
+            });
+
+            const preBookedChartData = filteredPreBookedData.map(d => ({ x: d.date, y: d.id }));
+            
+            const preBookedDataset = chart.data.datasets.find(ds => ds.label === 'Попередньо записані');
+            if (preBookedDataset) {
+                preBookedDataset.data = preBookedChartData;
+                chart.update();
+                
+                // Execute pending freeze if there is one (from deep link)
+                if (chart.pendingFreezeId && chart.freezeAtId) {
+                    setTimeout(() => {
+                        chart.freezeAtId(chart, chart.pendingFreezeId);
+                        delete chart.pendingFreezeId;
+                    }, 100);
+                }
+            }
         }
     </script>
 </body>

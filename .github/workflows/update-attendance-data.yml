@@ -1,0 +1,57 @@
+name: Update Attendance Data
+
+on:
+  schedule:
+    - cron: '0 3 * * *'  # Щодня о 3:00 UTC (5:00 за київським часом)
+  workflow_dispatch:  # Можна запустити вручну
+
+permissions:
+  contents: write
+
+jobs:
+  update-data:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      
+      - name: Setup Google Sheets credentials
+        run: echo '${{ secrets.SERVICE_ACCOUNT_KEY }}' > service_account_key.json
+      
+      - name: Sync daily sheets and generate JSON
+        run: python sync_for_github_actions.py
+      
+      - name: Clean up credentials
+        if: always()
+        run: rm -f service_account_key.json
+      
+      - name: Check for changes
+        id: git-check
+        run: |
+          git diff --quiet attendance_data.json daily_sheets_cache/ || echo "changed=true" >> $GITHUB_OUTPUT
+      
+      - name: Commit and push changes
+        if: steps.git-check.outputs.changed == 'true'
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add attendance_data.json daily_sheets_cache/
+          git commit -m "Автооновлення даних: $(date +'%Y-%m-%d %H:%M')"
+          git push
+      
+      - name: No changes detected
+        if: steps.git-check.outputs.changed != 'true'
+        run: echo "Немає змін для commit"
+
