@@ -24,6 +24,10 @@
         <img src="favicon.ico" alt="ВЛК" class="header-icon">
         <h1>Прогноз черги ВЛК на Закревського 81/1</h1>
     </div>
+    <div id="info-container" style="display: flex; flex-wrap: wrap; gap: 15px; margin: 10px 0; align-items: baseline;">
+        <div id="next-day-info" style="font-size: 1.1em; font-weight: bold; color: #2e7d32;"></div>
+        <div id="stats-info" style="color: #666; font-size: 0.9em;"></div>
+    </div>
     <div id="loading">Завантаження даних з Google Таблиці...</div>
     <div id="error" class="error"></div>
     
@@ -48,9 +52,9 @@
         
         // Google Sheet CSV URL for pre-booked data
         const SHEET_ID = '1d9OG-0b7wxxqrOujC9v6ikhjMKL2ei3wfrfaG61zSjA';
-        const HISTORICAL_DATA_SHEET = '84071606';
+        const PRE_BOOKED_SHEET_ID = '84071606';
         
-        const historicalDataUrl = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&gid=${HISTORICAL_DATA_SHEET}`;
+        const preBookedDataUrl = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&gid=${PRE_BOOKED_SHEET_ID}`;
 
         const isLocalhost = window.location.hostname === 'localhost' || 
                             window.location.hostname === '127.0.0.1' ||
@@ -59,9 +63,11 @@
         // Attendance data from daily sheets
         const ATTENDANCE_DATA_URL = 'attendance_data.json';
         
-        const HISTORICAL_DATA_URL = isLocalhost 
-            ? 'https://corsproxy.io/?' + encodeURIComponent(historicalDataUrl) 
-            : historicalDataUrl;
+        const PRE_BOOKED_PROXY_URL = isLocalhost 
+            ? 'https://corsproxy.io/?' + encodeURIComponent(preBookedDataUrl) 
+            : preBookedDataUrl;
+
+        let migratedDataUrl = null;
 
         // --- Константи налаштування прогнозної моделі ---
         const WEIGHT_EXP_MIN = -3;  // Мінімальна експонента ваги (для найстаріших точок)
@@ -74,7 +80,7 @@
                 .then(response => response.text())
                 .then(csvText => {
                     return new Promise((resolve, reject) => {
-                        const options = url.includes(HISTORICAL_DATA_SHEET)
+                        const options = url.includes(PRE_BOOKED_SHEET_ID)
                             ? { columns: true, skip_empty_lines: true, from_line: 3 }
                             // url.includes(STATS_SHEET)
                             : { columns: true, skip_empty_lines: true };
@@ -101,6 +107,74 @@
             
             // Safer: Set hour to 12:00 to avoid DST shifts affecting "midnight" logic
             return new Date(match[3], match[2] - 1, match[1], 12, 0, 0); 
+        }
+
+        async function fetchMigratedData(attendanceData) {
+            if (!attendanceData || !attendanceData.attendance_points || attendanceData.attendance_points.length === 0) {
+                return { migratedIds: [], currentDate: null };
+            }
+
+            const dates = attendanceData.attendance_points.map(p => p.date);
+            dates.sort();
+            const latestDate = dates[dates.length - 1];
+            
+            const csvFileName = `daily_sheets_cache/${latestDate}.csv`;
+            migratedDataUrl = csvFileName;
+            
+            try {
+                const response = await fetch(csvFileName);
+                const csvText = await response.text();
+                
+                const lines = csvText.split('\n');
+                let currentDateParsed = null;
+                
+                for (let i = 0; i < Math.min(5, lines.length); i++) {
+                    if (lines[i].includes('Поточний прийом')) {
+                        const dateMatch = lines[i].match(/(\d{2}\.\d{2}\.\d{4})/);
+                        if (dateMatch) {
+                            currentDateParsed = parseDate(dateMatch[1]);
+                        }
+                        break;
+                    }
+                }
+                
+                const records = await new Promise((resolve, reject) => {
+                    parse(csvText, { 
+                        columns: true, 
+                        skip_empty_lines: true,
+                        from_line: 4,
+                        relax_column_count: true
+                    }, (err, records) => {
+                        if (err) reject(err);
+                        else resolve(records);
+                    });
+                });
+                
+                const migratedIds = [];
+                const idColumnName = Object.keys(records[0] || {}).find(key => 
+                    key.includes('ID') && key.includes('номер первинної черги')
+                );
+                
+                if (!idColumnName) {
+                    console.warn('Не знайдено колонку ID в CSV файлі');
+                    return { migratedIds: [], currentDate: currentDateParsed };
+                }
+                
+                records.forEach(row => {
+                    const idStr = String(row[idColumnName] || '').trim();
+                    if (/^\d+/.test(idStr)) {
+                        const id = parseInt(idStr, 10);
+                        if (!isNaN(id)) {
+                            migratedIds.push(id);
+                        }
+                    }
+                });
+                
+                return { migratedIds, currentDate: currentDateParsed };
+            } catch (err) {
+                console.error('Помилка завантаження міграційних даних:', err);
+                return { migratedIds: [], currentDate: null };
+            }
         }
 
         // Anchor date: Monday, Jan 5, 1970
@@ -169,23 +243,32 @@
 
         let chartInstance = null;
 
+        let globalAttendanceData = null;
+        let globalMigratedData = null;
+
         fetch(ATTENDANCE_DATA_URL)
             .then(r => r.json())
             .then(attendanceData => {
+                globalAttendanceData = attendanceData;
+                document.getElementById('loading').textContent = 'Завантаження міграційних даних...';
+                return fetchMigratedData(attendanceData);
+            })
+            .then(migratedData => {
+                globalMigratedData = migratedData;
                 document.getElementById('loading').textContent = 'Завантаження даних попередніх записів...';
                 try {
-                    chartInstance = processAndRender(attendanceData, null);
+                    chartInstance = processAndRender(globalAttendanceData, null, null);
                 } catch (e) {
                     console.error(e);
                     document.getElementById('error').textContent = "Error: " + e.message;
                 }
                 
-                return fetchAndParse(HISTORICAL_DATA_URL);
+                return fetchAndParse(PRE_BOOKED_PROXY_URL);
             })
-            .then(historicalData => {
+            .then(preBookedRecords => {
                 document.getElementById('loading').style.display = 'none';
                 try {
-                    updateChartWithPreBookedData(chartInstance, historicalData);
+                    updateChartWithPreBookedData(chartInstance, preBookedRecords, globalMigratedData);
                 } catch (e) {
                     console.error(e);
                     document.getElementById('error').textContent = "Error updating pre-booked data: " + e.message;
@@ -196,15 +279,16 @@
                 document.getElementById('error').textContent = "Failed to load data: " + err.message;
             });
 
-        function processAndRender(attendanceData, historicalData) {
+        function processAndRender(attendanceData, preBookedRecords, migratedData) {
             console.log(`Завантажено ${attendanceData.total_points} точок відвідуваності`);
             
             let globalMaxId = 0;
             const preBookedData = [];
+            const migratedChartData = [];
 
             // Обробка даних попередніх записів (якщо вони доступні)
-            if (historicalData) {
-                historicalData.forEach(row => {
+            if (preBookedRecords) {
+                preBookedRecords.forEach(row => {
                     const idStr = String(row['ID'] || '').trim();
                     const dateStr = String(row['Дата'] || '').trim();
                     
@@ -277,6 +361,17 @@
             const targetEndId = Math.max(globalMaxId, maxId) + 100;
 
             if (allAttendancePoints.length === 0) throw new Error("Дійсних даних не знайдено.");
+
+            // Calculate average daily count (last 10 days)
+            const dailyCounts = Array.from(dailyRanges.values()).map(d => ({
+                date: d.date,
+                count: d.ids.length
+            }));
+            dailyCounts.sort((a, b) => b.date - a.date); // Descending
+            const last10 = dailyCounts.slice(0, 10);
+            const avgDailyCount = last10.length > 0 
+                ? Math.round(last10.reduce((sum, item) => sum + item.count, 0) / last10.length)
+                : 0;
 
             // Фільтрація попередніх записів (> 3 місяці від останньої історичної дати)
             const lastHistoricalDateOrdinal = maxDateOrdinal;
@@ -443,7 +538,7 @@
             const l50Data = filterFutureOnly(allL50Data);
             const h50Data = filterFutureOnly(allH50Data);
 
-            const chart = renderChart(regularPoints, liveQueuePoints, histRanges, preBookedChartData, 
+            const chart = renderChart(regularPoints, liveQueuePoints, histRanges, preBookedChartData, migratedChartData,
                 meanData, l90Data, h90Data, l50Data, h50Data,
                 allMeanData, allL90Data, allH90Data, allL50Data, allH50Data);
             
@@ -455,11 +550,12 @@
                 allL90Data,
                 allH90Data,
                 allL50Data,
-                allH50Data
+                allH50Data,
+                avgDailyCount
             };
         }
 
-        function renderChart(regularPoints, liveQueuePoints, histRanges, preBookedData, 
+        function renderChart(regularPoints, liveQueuePoints, histRanges, preBookedData, migratedData,
                              meanData, l90Data, h90Data, l50Data, h50Data,
                              allMeanData, allL90Data, allH90Data, allL50Data, allH50Data) {
             const ctx = document.getElementById('queueChart').getContext('2d');
@@ -527,13 +623,25 @@
                     actualDate = histMatch.x;
                     actualType = 'Історична дата';
                 } else {
-                    // Check Pre-booked - read from chart dataset to get current data
+                    // Check Pre-booked
                     const preBookedDataset = chart.data.datasets.find(ds => ds.label === 'Попередньо записані');
                     if (preBookedDataset && preBookedDataset.data) {
                         const preBookedMatch = preBookedDataset.data.find(d => d.y === targetId);
                         if (preBookedMatch) {
                             actualDate = preBookedMatch.x;
                             actualType = 'Запис на';
+                        }
+                    }
+                    
+                    // Check Migrated
+                    if (!actualDate) {
+                        const migratedDataset = chart.data.datasets.find(ds => ds.label === 'Перенесені');
+                        if (migratedDataset && migratedDataset.data) {
+                            const migratedMatch = migratedDataset.data.find(d => d.y === targetId);
+                            if (migratedMatch) {
+                                actualDate = migratedMatch.x;
+                                actualType = 'Перенесено на';
+                            }
                         }
                     }
                 }
@@ -784,12 +892,22 @@
                         {
                             label: 'Попередньо записані',
                             data: preBookedData,
-                            backgroundColor: 'rgba(255, 165, 0, 0.8)', // Solid Orange
+                            backgroundColor: 'rgba(255, 165, 0, 0.8)',
                             borderColor: 'rgba(255, 140, 0, 1)',
                             borderWidth: 1,
                             pointRadius: 3,
                             pointStyle: 'rectRot', 
-                            order: 0 // Topmost layer
+                            order: 0
+                        },
+                        {
+                            label: 'Перенесені',
+                            data: migratedData,
+                            backgroundColor: 'rgba(255, 0, 0, 0.8)',
+                            borderColor: 'rgba(200, 0, 0, 1)',
+                            borderWidth: 1,
+                            pointRadius: 3,
+                            pointStyle: 'rect',
+                            order: 0
                         },
                         {
                             label: '95% Шанс',
@@ -951,17 +1069,18 @@
             return chart;
         }
 
-        function updateChartWithPreBookedData(chartData, historicalData) {
-            if (!chartData || !chartData.chart || !historicalData) return;
+        function updateChartWithPreBookedData(chartData, preBookedRecords, migratedData) {
+            if (!chartData || !chartData.chart || !preBookedRecords) return;
 
             const chart = chartData.chart;
             const maxId = chartData.maxId;
             const maxDateOrdinal = chartData.maxDateOrdinal;
+            const avgDailyCount = chartData.avgDailyCount || 0;
             
             let globalMaxId = maxId;
             const preBookedData = [];
 
-            historicalData.forEach(row => {
+            preBookedRecords.forEach(row => {
                 const idStr = String(row['ID'] || '').trim();
                 const dateStr = String(row['Дата'] || '').trim();
                 
@@ -978,6 +1097,44 @@
                 }
             });
 
+            const preBookedIds = new Set(preBookedData.map(d => d.id));
+            
+            let earliestPreBookedDate = null;
+            if (preBookedData.length > 0) {
+                preBookedData.sort((a, b) => a.date - b.date);
+                earliestPreBookedDate = preBookedData[0].date;
+            }
+            
+            const actualMigratedData = [];
+            if (migratedData && migratedData.migratedIds && earliestPreBookedDate) {
+                migratedData.migratedIds.forEach(id => {
+                    if (!preBookedIds.has(id)) {
+                        actualMigratedData.push({ id: id, date: earliestPreBookedDate });
+                    }
+                });
+            }
+
+            const allScheduledData = [...preBookedData, ...actualMigratedData];
+
+            if (allScheduledData.length > 0) {
+                allScheduledData.sort((a, b) => a.date - b.date);
+                
+                const nextDate = allScheduledData[0].date;
+                const count = allScheduledData.filter(d => d.date.getTime() === nextDate.getTime()).length;
+                
+                const dateStr = nextDate.toLocaleDateString('uk-UA', { day: 'numeric', month: 'long' });
+                
+                const infoDiv = document.getElementById('next-day-info');
+                if (infoDiv) {
+                    infoDiv.textContent = `На найближчу дату (${dateStr}) записано: ${count} осіб`;
+                }
+
+                const statsDiv = document.getElementById('stats-info');
+                if (statsDiv) {
+                    statsDiv.textContent = `(Середнє "Зайшов" за 10 днів: ~${avgDailyCount})`;
+                }
+            }
+
             const lastHistoricalDateOrdinal = maxDateOrdinal;
             const cutoffOrdinal = lastHistoricalDateOrdinal + 65;
             
@@ -986,20 +1143,31 @@
                 return ord <= cutoffOrdinal;
             });
 
+            const filteredMigratedData = actualMigratedData.filter(d => {
+                const ord = toOrdinal(d.date);
+                return ord <= cutoffOrdinal;
+            });
+
             const preBookedChartData = filteredPreBookedData.map(d => ({ x: d.date, y: d.id }));
+            const migratedChartData = filteredMigratedData.map(d => ({ x: d.date, y: d.id }));
             
             const preBookedDataset = chart.data.datasets.find(ds => ds.label === 'Попередньо записані');
             if (preBookedDataset) {
                 preBookedDataset.data = preBookedChartData;
-                chart.update();
-                
-                // Execute pending freeze if there is one (from deep link)
-                if (chart.pendingFreezeId && chart.freezeAtId) {
-                    setTimeout(() => {
-                        chart.freezeAtId(chart, chart.pendingFreezeId);
-                        delete chart.pendingFreezeId;
-                    }, 100);
-                }
+            }
+
+            const migratedDataset = chart.data.datasets.find(ds => ds.label === 'Перенесені');
+            if (migratedDataset) {
+                migratedDataset.data = migratedChartData;
+            }
+
+            chart.update();
+            
+            if (chart.pendingFreezeId && chart.freezeAtId) {
+                setTimeout(() => {
+                    chart.freezeAtId(chart, chart.pendingFreezeId);
+                    delete chart.pendingFreezeId;
+                }, 100);
             }
         }
     </script>
