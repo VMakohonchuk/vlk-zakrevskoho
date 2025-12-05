@@ -32,7 +32,7 @@
     <div id="error" class="error"></div>
     
     <div style="margin-bottom: 10px; display: flex; align-items: center; gap: 10px;">
-        <input type="number" id="queueInput" placeholder="Введіть номер черги" style="padding: 5px; width: 150px;">
+        <input type="text" id="queueInput" placeholder="Введіть номер черги (наприклад, 4148 або 4148/1)" style="padding: 5px; width: 250px;">
         <button id="findBtn" style="padding: 5px 10px; cursor: pointer;">Показати прогноз</button>
         <button id="resetZoomBtn" style="padding: 5px 10px; cursor: pointer;">Скинути зум</button>
         <span style="margin-left: auto; color: #555; font-style: italic;">👉 Натисніть на графік щоб побачити ймовірності початку ВЛК</span>
@@ -75,22 +75,41 @@
         const LIVE_QUEUE_WEIGHT = 0; // Вага для живої черги (0 = виключити з розрахунків)
 
         // --- Helper Functions ---
-        function fetchAndParse(url) {
-            return fetch(url)
-                .then(response => response.text())
-                .then(csvText => {
-                    return new Promise((resolve, reject) => {
-                        const options = url.includes(PRE_BOOKED_SHEET_ID)
-                            ? { columns: true, skip_empty_lines: true, from_line: 3 }
-                            // url.includes(STATS_SHEET)
-                            : { columns: true, skip_empty_lines: true };
-                        
-                        parse(csvText, options, (err, records) => {
-                            if (err) reject(err);
-                            else resolve(records);
-                        });
-                    });
-                });
+
+        function idToNumeric(idVal) {
+            // Converts ID string to numeric value for regression
+            // "1234" -> 1234.0
+            // "1234/1" -> 1234.01
+            // "1234/2" -> 1234.02
+            const s = String(idVal).trim();
+            if (!s) return null;
+            
+            if (s.includes('/')) {
+                const parts = s.split('/');
+                const main = parseInt(parts[0], 10);
+                if (isNaN(main)) return null;
+                
+                let sub = 0;
+                if (parts.length > 1) {
+                    const subNum = parseInt(parts[1], 10);
+                    if (!isNaN(subNum)) {
+                        sub = subNum;
+                    }
+                }
+                return main + (sub / 100.0);
+            }
+            
+            // Try parsing as plain number
+            const num = parseFloat(s);
+            if (!isNaN(num)) return num;
+            
+            // Fallback: extract first sequence of digits
+            const match = s.match(/^(\d+)/);
+            if (match) {
+                return parseFloat(match[1]);
+            }
+            
+            return null;
         }
 
         function parseDate(dateStr) {
@@ -263,7 +282,20 @@
                     document.getElementById('error').textContent = "Error: " + e.message;
                 }
                 
-                return fetchAndParse(PRE_BOOKED_PROXY_URL);
+                return fetch(PRE_BOOKED_PROXY_URL)
+                    .then(response => response.text())
+                    .then(csvText => {
+                        return new Promise((resolve, reject) => {
+                            parse(csvText, {
+                                columns: true, 
+                                skip_empty_lines: true, 
+                                from_line: 3 
+                            }, (err, records) => {
+                                if (err) reject(err);
+                                else resolve(records);
+                            });
+                        });
+                    });
             })
             .then(preBookedRecords => {
                 document.getElementById('loading').style.display = 'none';
@@ -317,23 +349,36 @@
             // Групуємо дані за датами для візуалізації діапазонів
             const dailyRanges = new Map();
             
+            // Створюємо mapping: numeric ID -> original string ID
+            const numericToOriginalId = new Map();
+            
             attendanceData.attendance_points.forEach(point => {
-                const id = point.id;
+                // Конвертуємо string ID в numeric (для регресії)
+                const idOriginal = String(point.id);
+                const idNumeric = idToNumeric(idOriginal);
+                if (idNumeric === null || isNaN(idNumeric)) {
+                    console.warn('Пропущено невалідний ID:', point.id);
+                    return;
+                }
+                
+                // Зберігаємо mapping для відображення
+                numericToOriginalId.set(idNumeric, idOriginal);
+                
                 const date = new Date(point.date + 'T12:00:00');
                 const ordinal = toOrdinal(date);
                 const isLive = point.is_live || false;
                 
-                const pointData = { id, date, ordinal, isLive };
+                const pointData = { id: idNumeric, idOriginal, date, ordinal, isLive };
                 allAttendancePoints.push(pointData);
                 
                 // Розділяємо на живу чергу та регулярну
                 if (isLive) {
-                    liveQueuePoints.push({ x: date, y: id });
+                    liveQueuePoints.push({ x: date, y: idNumeric, idOriginal });
                 } else {
-                    regularPoints.push({ x: date, y: id });
+                    regularPoints.push({ x: date, y: idNumeric, idOriginal });
                 }
                 
-                if (id > maxId) maxId = id;
+                if (idNumeric > maxId) maxId = idNumeric;
                 if (ordinal > maxDateOrdinal) maxDateOrdinal = ordinal;
                 if (ordinal < minDateOrdinal) minDateOrdinal = ordinal;
                 
@@ -341,7 +386,7 @@
                 if (!dailyRanges.has(point.date)) {
                     dailyRanges.set(point.date, { ids: [], date: date });
                 }
-                dailyRanges.get(point.date).ids.push(id);
+                dailyRanges.get(point.date).ids.push(idNumeric);
             });
             
             // Створюємо діапазони для візуалізації
@@ -540,7 +585,7 @@
 
             const chart = renderChart(regularPoints, liveQueuePoints, histRanges, preBookedChartData, migratedChartData,
                 meanData, l90Data, h90Data, l50Data, h50Data,
-                allMeanData, allL90Data, allH90Data, allL50Data, allH50Data);
+                allMeanData, allL90Data, allH90Data, allL50Data, allH50Data, numericToOriginalId);
             
             return {
                 chart,
@@ -551,13 +596,14 @@
                 allH90Data,
                 allL50Data,
                 allH50Data,
-                avgDailyCount
+                avgDailyCount,
+                numericToOriginalId
             };
         }
 
         function renderChart(regularPoints, liveQueuePoints, histRanges, preBookedData, migratedData,
                              meanData, l90Data, h90Data, l50Data, h50Data,
-                             allMeanData, allL90Data, allH90Data, allL50Data, allH50Data) {
+                             allMeanData, allL90Data, allH90Data, allL50Data, allH50Data, numericToOriginalId) {
             const ctx = document.getElementById('queueChart').getContext('2d');
             
             // Об'єднуємо для зворотної сумісності з freezeAtId
@@ -602,7 +648,12 @@
             const freezeAtId = (chart, targetId) => {
                 // Find nearest point in allMeanData (unfiltered)
                 if (!allMeanData || allMeanData.length === 0) {
-                    console.error('allMeanData is empty');
+                    console.error('allMeanData is empty', { 
+                        allMeanData, 
+                        allL90Data: allL90Data?.length,
+                        predPointsLength: predPoints?.length 
+                    });
+                    alert('Помилка: дані прогнозу не завантажені. Спробуйте перезавантажити сторінку.');
                     return;
                 }
                 
@@ -615,18 +666,20 @@
                 
                 // Check if this ID exists in Historical or Pre-booked data
                 let actualDate = null;
-                let actualType = null; // 'Historical' or 'Pre-booked'
+                let actualType = null;
+                let actualIdOriginal = null;
                 
-                // Check Historical
-                const histMatch = histData.find(d => d.y === targetId);
+                // Check Historical (both regular and live queue)
+                const histMatch = histData.find(d => Math.abs(d.y - targetId) < 0.001);
                 if (histMatch) {
                     actualDate = histMatch.x;
                     actualType = 'Історична дата';
+                    actualIdOriginal = histMatch.idOriginal || null;
                 } else {
                     // Check Pre-booked
                     const preBookedDataset = chart.data.datasets.find(ds => ds.label === 'Попередньо записані');
                     if (preBookedDataset && preBookedDataset.data) {
-                        const preBookedMatch = preBookedDataset.data.find(d => d.y === targetId);
+                        const preBookedMatch = preBookedDataset.data.find(d => Math.abs(d.y - targetId) < 0.001);
                         if (preBookedMatch) {
                             actualDate = preBookedMatch.x;
                             actualType = 'Запис на';
@@ -637,7 +690,7 @@
                     if (!actualDate) {
                         const migratedDataset = chart.data.datasets.find(ds => ds.label === 'Перенесені');
                         if (migratedDataset && migratedDataset.data) {
-                            const migratedMatch = migratedDataset.data.find(d => d.y === targetId);
+                            const migratedMatch = migratedDataset.data.find(d => Math.abs(d.y - targetId) < 0.001);
                             if (migratedMatch) {
                                 actualDate = migratedMatch.x;
                                 actualType = 'Перенесено на';
@@ -650,8 +703,12 @@
                     chart.frozen = true;
                     chart.options.plugins.tooltip.enabled = false;
                     
+                    // Знаходимо оригінальний string ID
+                    const displayId = actualIdOriginal || numericToOriginalId.get(nearest.y) || String(Math.round(nearest.y));
+                    
                     chart.frozenData = {
                         id: nearest.y,
+                        idDisplay: displayId,
                         mean: nearest.x,
                         l90: allL90Data[idx].x,
                         h90: allH90Data[idx].x,
@@ -697,9 +754,14 @@
                     const btn = document.getElementById('findBtn');
                     
                     const handleSearch = () => {
-                        const val = parseInt(input.value, 10);
-                        if (!isNaN(val)) {
+                        const inputStr = input.value.trim();
+                        if (!inputStr) return;
+                        
+                        const val = idToNumeric(inputStr);
+                        if (val !== null && !isNaN(val)) {
                             freezeAtId(chart, val);
+                        } else {
+                            alert('Невірний формат номера черги. Використовуйте формат: 4148 або 4148/1');
                         }
                     };
                     
@@ -716,9 +778,9 @@
                     const urlParams = new URLSearchParams(window.location.search);
                     const idParam = urlParams.get('id');
                     if (idParam) {
-                        const val = parseInt(idParam, 10);
-                        if (!isNaN(val)) {
-                            input.value = val;
+                        const val = idToNumeric(idParam);
+                        if (val !== null && !isNaN(val)) {
+                            input.value = idParam; // Keep original format
                             // Store the pending freeze ID, will be executed after pre-booked data loads
                             chart.pendingFreezeId = val;
                         }
@@ -803,7 +865,7 @@
                         const formatDate = (d) => d.toISOString().split('T')[0];
                         
                         const textLines = [
-                            `Номер у черзі: ${data.id}`,
+                            `Номер у черзі: ${data.idDisplay}`,
                             `5% шансу: ${formatDate(data.l90)}`,
                             `25% шансу: ${formatDate(data.l50)}`,
                             `50% шансу: ${formatDate(data.mean)}`,
@@ -1018,7 +1080,11 @@
                                 title: function(context) {
                                     // Show Queue ID in the tooltip title
                                     if (context.length > 0) {
-                                        return `Номер у черзі: ${context[0].parsed.y}`;
+                                        const numericId = context[0].parsed.y;
+                                        const originalId = context[0].raw?.idOriginal || 
+                                                          numericToOriginalId.get(numericId) || 
+                                                          String(Math.round(numericId));
+                                        return `Номер у черзі: ${originalId}`;
                                     }
                                     return '';
                                 },

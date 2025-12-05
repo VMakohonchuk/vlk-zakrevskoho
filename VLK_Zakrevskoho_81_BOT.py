@@ -797,39 +797,38 @@ async def display_queue_data(update: Update, data_frame: pd.DataFrame, title: st
 # --- ФУНКЦІЇ ОБРОБНИКІВ КОМАНД ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message.chat.type == 'private':
-        user = update.effective_user
-        logger.info(f"Користувач {get_user_log_info(user)} розпочав розмову.")
-        
-        caption_text = (
-            f"Вітаю, {user.mention_html()}\n"
-            "Я бот для запису в електронну чергу ВЛК на Закревського, 81/1\n"
-            "1. Ознайомтеся з інфографікою 👆\n"
-            "2. Оберайте потрібну команду за допомогою кнопок:\n"
-            "* <code>Записатися / Перенести</code> - записатися або перенести дату відвідання\n"
-            "* <code>Скасувати запис</code> - скасувати свій запис\n"
-            "* <code>Переглянути чергу</code> - переглянути поточну чергу повністю або на обраний день\n"
-            "* <code>Прогноз черги</code> - графік ймовірності проходження черги\n"
-            "* <code>Відкрити таблицю</code> - перейти до таблиці Google Sheets з даними черги (тільки для адміністраторів)\n"
-            #"<code>Очистити чергу</code> - очистити чергу (тільки для адміністраторів)\n"
-            "* <code>Скасувати ввід</code> - скасувати ввід під час діалогу"
-        )
+    user = update.effective_user
+    logger.info(f"Користувач {get_user_log_info(user)} розпочав розмову.")
+    
+    caption_text = (
+        f"Вітаю, {user.mention_html()}\n"
+        "Я бот для запису в електронну чергу ВЛК на Закревського, 81/1\n"
+        "1. Ознайомтеся з інфографікою 👆\n"
+        "2. Оберайте потрібну команду за допомогою кнопок:\n"
+        "* <code>Записатися / Перенести</code> - записатися або перенести дату відвідання\n"
+        "* <code>Скасувати запис</code> - скасувати свій запис\n"
+        "* <code>Переглянути чергу</code> - переглянути поточну чергу повністю або на обраний день\n"
+        "* <code>Прогноз черги</code> - графік ймовірності проходження черги\n"
+        "* <code>Відкрити таблицю</code> - перейти до таблиці Google Sheets з даними черги (тільки для адміністраторів)\n"
+        #"<code>Очистити чергу</code> - очистити чергу (тільки для адміністраторів)\n"
+        "* <code>Скасувати ввід</code> - скасувати ввід під час діалогу"
+    )
 
-        try:
-            with open('infographic.jpg', 'rb') as photo:
-                await update.message.reply_photo(
-                    photo=photo,
-                    caption=caption_text,
-                    parse_mode='HTML',
-                    reply_markup=MAIN_KEYBOARD
-                )
-        except Exception as e:
-            logger.error(f"Не вдалося надіслати фото (infographic.jpg): {e}")
-            # Fallback to text only if image fails
-            await update.message.reply_html(
-                caption_text,
-                reply_markup=MAIN_KEYBOARD,
+    try:
+        with open('infographic.jpg', 'rb') as photo:
+            await update.message.reply_photo(
+                photo=photo,
+                caption=caption_text,
+                parse_mode='HTML',
+                reply_markup=MAIN_KEYBOARD
             )
+    except Exception as e:
+        logger.error(f"Не вдалося надіслати фото (infographic.jpg): {e}")
+        # Fallback to text only if image fails
+        await update.message.reply_html(
+            caption_text,
+            reply_markup=MAIN_KEYBOARD,
+        )
 
     # Функція, яка містить основну логіку очищення
 async def perform_queue_cleanup(logger_info_prefix: str = "Очищення за розкладом"):
@@ -1583,7 +1582,10 @@ async def join_get_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     if save_queue_data(new_entry_df): # Перевіряємо результат збереження
         # Оновлюємо глобальний DataFrame ТІЛЬКИ ПІСЛЯ УСПІШНОГО ЗБЕРЕЖЕННЯ
         queue_df = pd.concat([queue_df, new_entry_df], ignore_index=True)
-        notification_text = f"✅ Користувач {update.effective_user.mention_html()}\nстворив або переніс запис для\nID <code>{user_id}</code> на <code>{chosen_date.strftime('%d.%m.%Y')}</code>" 
+        if previous_state:
+            notification_text = f"✅ Користувач {update.effective_user.mention_html()}\nпереніс запис для\nID <code>{user_id}</code> на <code>{chosen_date.strftime('%d.%m.%Y')}</code>" 
+        else:
+            notification_text = f"✅ Користувач {update.effective_user.mention_html()}\nстворив запис для\nID <code>{user_id}</code> на <code>{chosen_date.strftime('%d.%m.%Y')}</code>" 
         await send_group_notification(context, notification_text)
         message_text = f"Ви успішно створили заявку на запис/перенос дати в черзі!\nВаш ID: `{user_id}`, Обрана дата: `{chosen_date.strftime('%d.%m.%Y')}`\nСтатус заявки: `На розгляді`\nВаша заявка на розгляді у адміністраторів.\nЯкщо вона буде \"Ухвалена\", то через деякий час з'явиться в жовтій таблиці 🟡TODO."
         await update.message.reply_text(message_text, parse_mode='Markdown', reply_markup=MAIN_KEYBOARD)
@@ -2213,14 +2215,13 @@ async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ConversationHandler.END
 
 async def fallback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message.chat.type == 'private':
-        """Обробляє повідомлення, які не відповідають очікуванням в рамках розмови."""
-        logger.warning(f"Невідоме повідомлення від користувача {get_user_log_info(update.effective_user)}: '{update.message.text}'")
-        await update.message.reply_text(
-            "Будь ласка, дотримуйтесь інструкцій або скористайтеся кнопкою `Скасувати ввід`.",
-            parse_mode='Markdown',
-            reply_markup=MAIN_KEYBOARD # Додаємо клавіатуру
-        )
+    """Обробляє повідомлення, які не відповідають очікуванням в рамках розмови."""
+    logger.warning(f"Невідоме повідомлення від користувача {get_user_log_info(update.effective_user)}: '{update.message.text}'")
+    await update.message.reply_text(
+        "Будь ласка, дотримуйтесь інструкцій або скористайтеся кнопкою `Скасувати ввід`.",
+        parse_mode='Markdown',
+        reply_markup=MAIN_KEYBOARD # Додаємо клавіатуру
+    )
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обробляє помилки, що виникли в боті.""" 
@@ -2244,13 +2245,12 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
     # Якщо об'єкт 'update' існує, можна повідомити користувача про помилку
     if update and update.effective_message:
-        if update.message.chat.type == 'private':
-            try:
-                await update.effective_message.reply_text(
-                    "Вибачте, виникла внутрішня помилка. Будь ласка, виконайте спробу пізніше."
-                )
-            except Exception as e:
-                logger.error("Не вдалося відправити повідомлення про помилку користувачу: %s", e)
+        try:
+            await update.effective_message.reply_text(
+                "Вибачте, виникла внутрішня помилка. Будь ласка, виконайте спробу пізніше."
+            )
+        except Exception as e:
+            logger.error("Не вдалося відправити повідомлення про помилку користувачу: %s", e)
 
 def main() -> None:
     initialize_bot()
@@ -2267,83 +2267,83 @@ def main() -> None:
     # Register the error handler
     application.add_error_handler(error_handler)
     # Обробник для /start завжди CommandHandler
-    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("start", start, filters=filters.ChatType.PRIVATE))
     # Обробники команд для керування адміністраторами
-    application.add_handler(CommandHandler("grant_admin", grant_admin))
-    application.add_handler(CommandHandler("drop_admin", drop_admin))
+    application.add_handler(CommandHandler("grant_admin", grant_admin, filters=filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("drop_admin", drop_admin, filters=filters.ChatType.PRIVATE))
     # Обробники команд для керування списком заблокованих
-    application.add_handler(CommandHandler("ban", ban))
-    application.add_handler(CommandHandler("unban", unban))
+    application.add_handler(CommandHandler("ban", ban, filters=filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("unban", unban, filters=filters.ChatType.PRIVATE))
 
     # --- ConversationHandlers повинні бути додані ПЕРШИМИ ---
     # Це дає їм пріоритет над іншими MessageHandler, коли розмова активна.
 
     # Обробник для кнопки "Скасувати ввід"
-    cancel_button_handler = MessageHandler(filters.TEXT & filters.Regex(BUTTON_TEXT_CANCEL_OP), cancel_conversation)
+    cancel_button_handler = MessageHandler(filters.TEXT & filters.Regex(BUTTON_TEXT_CANCEL_OP) & filters.ChatType.PRIVATE, cancel_conversation)
 
     join_conv_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.TEXT & filters.Regex(BUTTON_TEXT_JOIN), join_start)],
+        entry_points=[MessageHandler(filters.TEXT & filters.Regex(BUTTON_TEXT_JOIN) & filters.ChatType.PRIVATE, join_start)],
         states={
             JOIN_GETTING_ID: [
                 cancel_button_handler, # Переміщуємо на початок списку
-                MessageHandler(filters.TEXT & ~filters.COMMAND, join_get_id)
+                MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, join_get_id)
             ],
             JOIN_GETTING_DATE: [
                 cancel_button_handler, # Переміщуємо на початок списку
-                MessageHandler(filters.TEXT & ~filters.COMMAND, join_get_date)
+                MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, join_get_date)
             ],
         },
         fallbacks=[
-            CommandHandler("cancel", cancel_conversation) # Залишаємо на випадок ручного вводу /cancel
+            CommandHandler("cancel", cancel_conversation, filters=filters.ChatType.PRIVATE) # Залишаємо на випадок ручного вводу /cancel
         ],
         conversation_timeout=3600,  # Timeout in seconds (e.g., 3600 seconds)
         allow_reentry=True
     )
 
     cancel_record_conv_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.TEXT & filters.Regex(BUTTON_TEXT_CANCEL_RECORD), cancel_record_start)],
+        entry_points=[MessageHandler(filters.TEXT & filters.Regex(BUTTON_TEXT_CANCEL_RECORD) & filters.ChatType.PRIVATE, cancel_record_start)],
         states={
             CANCEL_GETTING_ID: [
                 cancel_button_handler, # Переміщуємо на початок списку
-                MessageHandler(filters.TEXT & ~filters.COMMAND, cancel_record_get_id)
+                MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, cancel_record_get_id)
             ],
         },
         fallbacks=[
-            CommandHandler("cancel", cancel_conversation)
+            CommandHandler("cancel", cancel_conversation, filters=filters.ChatType.PRIVATE)
         ],
         conversation_timeout=3600,  # Timeout in seconds (e.g., 3600 seconds)
         allow_reentry=True
     )
 
     show_conv_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.TEXT & filters.Regex(BUTTON_TEXT_SHOW), show_start)],
+        entry_points=[MessageHandler(filters.TEXT & filters.Regex(BUTTON_TEXT_SHOW) & filters.ChatType.PRIVATE, show_start)],
         states={
             SHOW_GETTING_OPTION: [
                 cancel_button_handler, # Переміщуємо на початок списку
-                MessageHandler(filters.TEXT & ~filters.COMMAND, show_get_option)
+                MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, show_get_option)
             ],
             SHOW_GETTING_DATE: [
                 cancel_button_handler, # Переміщуємо на початок списку
-                MessageHandler(filters.TEXT & ~filters.COMMAND, show_get_date)
+                MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, show_get_date)
             ],
         },
         fallbacks=[
-            CommandHandler("cancel", cancel_conversation)
+            CommandHandler("cancel", cancel_conversation, filters=filters.ChatType.PRIVATE)
         ],
         conversation_timeout=3600,  # Timeout in seconds (e.g., 3600 seconds)
         allow_reentry=True
     )
 
     status_conv_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.TEXT & filters.Regex(BUTTON_TEXT_STATUS), status_start)],
+        entry_points=[MessageHandler(filters.TEXT & filters.Regex(BUTTON_TEXT_STATUS) & filters.ChatType.PRIVATE, status_start)],
         states={
             STATUS_GETTING_ID: [
                 cancel_button_handler, # Переміщуємо на початок списку
-                MessageHandler(filters.TEXT & ~filters.COMMAND, status_get_id)
+                MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, status_get_id)
             ],
         },
         fallbacks=[
-            CommandHandler("cancel", cancel_conversation)
+            CommandHandler("cancel", cancel_conversation, filters=filters.ChatType.PRIVATE)
         ],
         conversation_timeout=3600,  # Timeout in seconds (e.g., 3600 seconds)
         allow_reentry=True
@@ -2357,19 +2357,19 @@ def main() -> None:
     
     # --- Загальні обробники для окремих кнопок (НЕ розмов) ---
     # Вони мають бути після ConversationHandler, але до загального fallback
-    application.add_handler(MessageHandler(filters.TEXT & filters.Regex(BUTTON_TEXT_OPEN_SHEET), open_sheet_command))
-    application.add_handler(MessageHandler(filters.TEXT & filters.Regex(BUTTON_TEXT_PREDICTION), prediction_command))
+    application.add_handler(MessageHandler(filters.TEXT & filters.Regex(BUTTON_TEXT_OPEN_SHEET) & filters.ChatType.PRIVATE, open_sheet_command))
+    application.add_handler(MessageHandler(filters.TEXT & filters.Regex(BUTTON_TEXT_PREDICTION) & filters.ChatType.PRIVATE, prediction_command))
     #application.add_handler(MessageHandler(filters.TEXT & filters.Regex(BUTTON_TEXT_CLEAR_QUEUE), clear_queue_command))
     # Обробник кнопки "Скасувати ввід" поза розмовами.
     # Він вже доданий як fallback у кожному ConversationHandler,
     # і також як окремий обробник тут, щоб спрацьовувати, якщо користувач просто натисне її,
     # коли немає активної розмови, і таким чином повернути MAIN_KEYBOARD.
-    application.add_handler(MessageHandler(filters.TEXT & filters.Regex(BUTTON_TEXT_CANCEL_OP), cancel_conversation)) # Обробник кнопки "Скасувати ввід" поза розмовами
+    application.add_handler(MessageHandler(filters.TEXT & filters.Regex(BUTTON_TEXT_CANCEL_OP) & filters.ChatType.PRIVATE, cancel_conversation)) # Обробник кнопки "Скасувати ввід" поза розмовами
 
     # --- Загальний fallback обробник ---
     # Цей обробник має бути ДОДАНИЙ ОСТАННІМ!
     # Він ловить ВСЕ, що не було оброблено попередніми обробниками.
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, fallback))
 
     # --- Налаштування планувальника ---
     kyiv_tz = timezone('Europe/Kyiv')        

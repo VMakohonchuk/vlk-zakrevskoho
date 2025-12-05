@@ -7,6 +7,7 @@ import datetime
 import csv
 import pandas as pd
 import logging
+import re
 from googleapiclient.errors import HttpError
 
 logger = logging.getLogger(__name__)
@@ -222,6 +223,38 @@ def sync_daily_sheets(sheets_service, stats_sheet_id, stats_worksheet_name, forc
     
     return True
 
+def id_to_numeric(id_val):
+    """
+    Converts ID string to numeric value for regression.
+    "1234" -> 1234.0
+    "1234/1" -> 1234.01
+    "1234/2" -> 1234.02
+    """
+    s = str(id_val).strip()
+    if not s:
+        return None
+    
+    try:
+        if '/' in s:
+            parts = s.split('/')
+            main = int(parts[0])
+            # Treat suffix as fractional part (e.g. /1 -> .01, /10 -> .10)
+            # Assuming suffix is numeric
+            sub = 0
+            if len(parts) > 1 and parts[1].isdigit():
+                sub = int(parts[1])
+            return main + (sub / 100.0)
+        
+        # Handle cases like "1234a" -> 1234? Or just pure digits?
+        # For now, try float directly
+        return float(s)
+    except ValueError:
+        # Fallback: extract first sequence of digits
+        match = re.match(r'^(\d+)', s)
+        if match:
+            return float(match.group(1))
+        return None
+
 def parse_daily_sheet_attendance(csv_file):
     """
     Парсить щоденний аркуш і повертає дані про ФАКТИЧНУ відвідуваність.
@@ -267,16 +300,17 @@ def parse_daily_sheet_attendance(csv_file):
         status = row[2].strip()
         
         # Пропускаємо порожні рядки та нечислові номери
-        if not number or not person_id:
+        if not number:
             continue
-        
+            
         if not number.isdigit():
             continue
         
-        try:
-            int(person_id)
-        except ValueError:
+        # Парсимо ID (може бути "1234/1") - зберігаємо як рядок для точного обліку
+        if not any(char.isdigit() for char in person_id):
             continue
+            
+        id_val = person_id.strip()
         
         total += 1
         status_lower = status.lower()
@@ -360,10 +394,11 @@ def extract_attended_ids_from_sheet(csv_file):
         if not number or not person_id or not number.isdigit():
             continue
         
-        try:
-            id_val = int(person_id)
-        except ValueError:
+        # Парсимо ID - зберігаємо як рядок
+        if not any(char.isdigit() for char in person_id):
             continue
+            
+        id_val = person_id.strip()
         
         # Тільки тих хто зайшов
         status_lower = status.lower()
@@ -410,12 +445,21 @@ def get_historical_attendance_data():
         attended_data = extract_attended_ids_from_sheet(filepath)
         
         if attended_data:
-            # attended_data тепер список об'єктів {'id': int, 'is_live': bool}
-            attended_ids = [item['id'] for item in attended_data]
+            # attended_data тепер список об'єктів {'id': string, 'is_live': bool}
+            # attended_ids для зворотної сумісності - конвертуємо в numeric
+            attended_ids = []
+            for item in attended_data:
+                num_id = id_to_numeric(item['id'])
+                if num_id is not None:
+                    attended_ids.append(num_id)
+            
+            if not attended_ids:
+                continue
+                
             data.append({
                 'date': date_obj,
-                'attended_data': attended_data,  # Зберігаємо повні дані з is_live
-                'attended_ids': attended_ids,    # Для зворотної сумісності
+                'attended_data': attended_data,  # Зберігаємо повні дані (string IDs)
+                'attended_ids': attended_ids,    # Numeric IDs
                 'count': len(attended_ids),
                 'min_id': min(attended_ids),
                 'max_id': max(attended_ids),
@@ -573,8 +617,14 @@ def calculate_prediction_from_attendance_json(user_id, attendance_data):
         try:
             date_obj = datetime.datetime.strptime(point['date'], '%Y-%m-%d').date()
             ordinal = get_ordinal_date(date_obj)
+            
+            # Convert ID to numeric for regression
+            numeric_id = id_to_numeric(point['id'])
+            if numeric_id is None:
+                continue
+                
             processed_points.append({
-                'id': point['id'],
+                'id': numeric_id, # Use numeric ID for regression
                 'ordinal': ordinal,
                 'is_live': point.get('is_live', False)
             })
@@ -739,8 +789,12 @@ def calculate_prediction_with_daily_data(user_id, use_daily_sheets=True, use_jso
     for _, row in hist_df.iterrows():
         date_ordinal = get_ordinal_date(row['date'])
         for attended_item in row['attended_data']:
+            numeric_id = id_to_numeric(attended_item['id'])
+            if numeric_id is None:
+                continue
+                
             points.append({
-                'id': attended_item['id'],
+                'id': numeric_id,
                 'ordinal': date_ordinal,
                 'is_live': attended_item['is_live']
             })
