@@ -155,20 +155,28 @@
             return new Date(match[3], match[2] - 1, match[1], 12, 0, 0); 
         }
 
-        async function fetchMigratedData(attendanceData) {
-            if (!attendanceData || !attendanceData.attendance_points || attendanceData.attendance_points.length === 0) {
-                return { migratedIds: [], currentDate: null };
-            }
+        async function fetchMigratedData(attendanceData, earliestPreBookedDate) {
+            if (!earliestPreBookedDate) {
+                if (!attendanceData || !attendanceData.attendance_points || attendanceData.attendance_points.length === 0) {
+                    return { migratedIds: [], currentDate: null };
+                }
 
-            const dates = attendanceData.attendance_points.map(p => p.date);
-            dates.sort();
-            const latestDate = dates[dates.length - 1];
+                const dates = attendanceData.attendance_points.map(p => p.date);
+                dates.sort();
+                const latestDate = dates[dates.length - 1];
+                earliestPreBookedDate = new Date(latestDate + 'T12:00:00');
+            }
             
-            const csvFileName = `daily_sheets_cache/${latestDate}.csv`;
+            const csvDate = earliestPreBookedDate.toISOString().split('T')[0];
+            const csvFileName = `daily_sheets_cache/${csvDate}.csv`;
             migratedDataUrl = csvFileName;
             
             try {
                 const response = await fetch(csvFileName);
+                if (!response.ok) {
+                    console.error(`Не вдалося завантажити CSV файл: ${csvFileName} (статус: ${response.status})`);
+                    throw new Error(`CSV файл ${csvFileName} не знайдено`);
+                }
                 const csvText = await response.text();
                 
                 const lines = csvText.split('\n');
@@ -186,31 +194,34 @@
                 
                 const records = await new Promise((resolve, reject) => {
                     parse(csvText, { 
-                        columns: true, 
+                        columns: false,
                         skip_empty_lines: true,
                         from_line: 4,
                         relax_column_count: true
                     }, (err, records) => {
-                        if (err) reject(err);
-                        else resolve(records);
+                        if (err) {
+                            console.error('CSV parse error:', err);
+                            reject(err);
+                        } else {
+                            resolve(records);
+                        }
                     });
                 });
                 
-                const migratedIds = [];
-                const idColumnName = Object.keys(records[0] || {}).find(key => 
-                    key.includes('ID') && key.includes('номер первинної черги')
-                );
-                
-                if (!idColumnName) {
-                    console.warn('Не знайдено колонку ID в CSV файлі');
+                if (!records || records.length === 0) {
+                    console.error(`CSV файл ${csvFileName} порожній`);
                     return { migratedIds: [], currentDate: currentDateParsed };
                 }
                 
+                const migratedIds = [];
+                const ID_COLUMN_INDEX = 7;
+                
                 records.forEach(row => {
-                    const idStr = String(row[idColumnName] || '').trim();
-                    // Приймаємо ID з цифрами (включно з "4794/4")
-                    if (idStr && /^\d{4}(\/\d)?/.test(idStr)) {
-                        migratedIds.push(idStr);
+                    if (row.length > ID_COLUMN_INDEX) {
+                        const idStr = String(row[ID_COLUMN_INDEX] || '').trim();
+                        if (idStr && /^\d{4}(\/\d)?/.test(idStr)) {
+                            migratedIds.push(idStr);
+                        }
                     }
                 });
                 
@@ -290,58 +301,64 @@
         let globalAttendanceData = null;
         let globalMigratedData = null;
 
-        fetch(ATTENDANCE_DATA_URL)
-            .then(r => r.json())
-            .then(attendanceData => {
-                globalAttendanceData = attendanceData;
-                document.getElementById('loading').textContent = 'Завантаження міграційних даних...';
-                return fetchMigratedData(attendanceData);
-            })
-            .then(migratedData => {
-                globalMigratedData = migratedData;
-                document.getElementById('loading').textContent = 'Завантаження даних попередніх записів...';
-                try {
-                    chartInstance = processAndRender(globalAttendanceData, null, null);
-                } catch (e) {
-                    console.error(e);
-                    document.getElementById('error').textContent = "Error: " + e.message;
-                }
-                
-                return fetch(PRE_BOOKED_PROXY_URL)
-                    .then(response => response.text())
-                    .then(csvText => {
-                        return new Promise((resolve, reject) => {
-                            parse(csvText, {
-                                columns: true, 
-                                skip_empty_lines: true, 
-                                from_line: 3 
-                            }, (err, records) => {
-                                if (err) reject(err);
-                                else resolve(records);
-                            });
+        Promise.all([
+            fetch(ATTENDANCE_DATA_URL).then(r => r.json()),
+            fetch(PRE_BOOKED_PROXY_URL)
+                .then(response => response.text())
+                .then(csvText => {
+                    return new Promise((resolve, reject) => {
+                        parse(csvText, {
+                            columns: true, 
+                            skip_empty_lines: true, 
+                            from_line: 3 
+                        }, (err, records) => {
+                            if (err) reject(err);
+                            else resolve(records);
                         });
                     });
-            })
-            .then(preBookedRecords => {
-                document.getElementById('loading').style.display = 'none';
-                try {
-                    updateChartWithPreBookedData(chartInstance, preBookedRecords, globalMigratedData);
-                } catch (e) {
-                    console.error(e);
-                    document.getElementById('error').textContent = "Error updating pre-booked data: " + e.message;
+                })
+        ])
+        .then(([attendanceData, preBookedRecords]) => {
+            globalAttendanceData = attendanceData;
+            
+            let earliestPreBookedDate = null;
+            if (preBookedRecords && preBookedRecords.length > 0) {
+                const dates = preBookedRecords
+                    .map(row => parseDate(String(row['Дата'] || '').trim()))
+                    .filter(d => d !== null);
+                
+                if (dates.length > 0) {
+                    dates.sort((a, b) => a - b);
+                    earliestPreBookedDate = dates[0];
                 }
-            })
-            .catch(err => {
-                document.getElementById('loading').style.display = 'none';
-                document.getElementById('error').textContent = "Failed to load data: " + err.message;
-            });
+            }
+            
+            document.getElementById('loading').textContent = 'Завантаження міграційних даних...';
+            return fetchMigratedData(attendanceData, earliestPreBookedDate)
+                .then(migratedData => ({ attendanceData, preBookedRecords, migratedData }));
+        })
+        .then(({ attendanceData, preBookedRecords, migratedData }) => {
+            globalMigratedData = migratedData;
+            document.getElementById('loading').style.display = 'none';
+            
+            try {
+                chartInstance = processAndRender(attendanceData, preBookedRecords, migratedData);
+            } catch (e) {
+                console.error(e);
+                document.getElementById('error').textContent = "Error: " + e.message;
+            }
+        })
+        .catch(err => {
+            document.getElementById('loading').style.display = 'none';
+            document.getElementById('error').textContent = "Failed to load data: " + err.message;
+        });
 
         function processAndRender(attendanceData, preBookedRecords, migratedData) {
             console.log(`Завантажено ${attendanceData.total_points} точок відвідуваності`);
             
-            // Обробка даних фактичної відвідуваності з щоденних аркушів
             let globalMaxId = 0;
-            const preBookedData = [];
+            
+            // Обробка даних фактичної відвідуваності з щоденних аркушів
             const allAttendancePoints = [];
             const liveQueuePoints = [];
             const regularPoints = [];
@@ -405,10 +422,7 @@
                 }
             });
             
-            // Початковий targetEndId: якщо немає preBookedRecords, використовуємо мінімальний буфер
-            const targetEndId = preBookedRecords 
-                ? Math.max(globalMaxId, maxId) + 100 
-                : maxId + 100;
+            const targetEndId = Math.max(globalMaxId, maxId) + 100;
 
             if (allAttendancePoints.length === 0) {
                 console.error('No attendance points found!');
@@ -428,9 +442,94 @@
                 ? Math.round(last10.reduce((sum, item) => sum + item.count, 0) / last10.length)
                 : 0;
 
-            // Pre-booked та Migrated дані будуть додані пізніше через updateChartWithPreBookedData
-            const preBookedChartData = [];
-            const migratedChartData = [];
+            // Обробка preBooked та migrated даних
+            const preBookedData = [];
+            
+            if (preBookedRecords) {
+                preBookedRecords.forEach(row => {
+                    const idStr = String(row['ID'] || '').trim();
+                    const dateStr = String(row['Дата'] || '').trim();
+                    
+                    if (!idStr || !/^\d{4}(\/\d)?/.test(idStr)) return;
+
+                    const idNumeric = idToNumeric(idStr);
+                    if (idNumeric === null || isNaN(idNumeric)) return;
+
+                    if (idNumeric > globalMaxId) globalMaxId = idNumeric;
+
+                    const date = parseDate(dateStr);
+                    if (date) {
+                        preBookedData.push({ id: idStr, idNumeric, date: date });
+                    }
+                });
+            }
+            
+            const preBookedIds = new Set(preBookedData.map(d => d.id));
+            let earliestPreBookedDate = null;
+            if (preBookedData.length > 0) {
+                preBookedData.sort((a, b) => a.date - b.date);
+                earliestPreBookedDate = preBookedData[0].date;
+            }
+            
+            const actualMigratedData = [];
+            if (migratedData && migratedData.migratedIds && earliestPreBookedDate) {
+                migratedData.migratedIds.forEach(id => {
+                    if (!preBookedIds.has(id)) {
+                        const idNumeric = idToNumeric(id);
+                        if (idNumeric !== null && !isNaN(idNumeric)) {
+                            actualMigratedData.push({ 
+                                id: id, 
+                                idNumeric: idNumeric, 
+                                date: earliestPreBookedDate 
+                            });
+                        }
+                    }
+                });
+            }
+            
+            const allScheduledData = [...preBookedData, ...actualMigratedData];
+            if (allScheduledData.length > 0) {
+                allScheduledData.sort((a, b) => a.date - b.date);
+                
+                const nextDate = allScheduledData[0].date;
+                const count = allScheduledData.filter(d => d.date.getTime() === nextDate.getTime()).length;
+                
+                const dateStr = nextDate.toLocaleDateString('uk-UA', { day: 'numeric', month: 'long' });
+                
+                const infoDiv = document.getElementById('next-day-info');
+                if (infoDiv) {
+                    infoDiv.textContent = `На найближчу дату (${dateStr}) записано: ${count} осіб`;
+                }
+
+                const statsDiv = document.getElementById('stats-info');
+                if (statsDiv) {
+                    statsDiv.textContent = `(Середнє "Зайшов" за 10 днів: ~${avgDailyCount})`;
+                }
+            }
+            
+            const lastHistoricalDateOrdinal = maxDateOrdinal;
+            const cutoffOrdinal = lastHistoricalDateOrdinal + 65;
+            
+            const filteredPreBookedData = preBookedData.filter(d => {
+                const ord = toOrdinal(d.date);
+                return ord <= cutoffOrdinal;
+            });
+
+            const filteredMigratedData = actualMigratedData.filter(d => {
+                const ord = toOrdinal(d.date);
+                return ord <= cutoffOrdinal;
+            });
+
+            const preBookedChartData = filteredPreBookedData.map(d => ({ 
+                x: d.date, 
+                y: d.idNumeric,
+                id: d.id 
+            }));
+            const migratedChartData = filteredMigratedData.map(d => ({ 
+                x: d.date, 
+                y: d.idNumeric,
+                id: d.id 
+            }));
 
             // Групуємо точки відвідуваності за ID для регресії
             // Якщо ID відвідав кілька разів, беремо середню дату
@@ -593,7 +692,6 @@
             
             console.log('Generated allMeanData points:', allMeanData.length);
 
-            // Фільтруємо прогнозні лінії: інтервали від наступного робочого дня, mean від найранішої дати
             const filterFutureOnly = (arr) => arr.filter(p => p.x.getTime() >= nextWorkingTime);
             const filterFromEarliest = (arr) => arr.filter(p => p.x.getTime() >= earliestHistoricalTime);
 
@@ -608,22 +706,14 @@
                 allMeanData, allL90Data, allH90Data, allL50Data, allH50Data, numericToOriginalId,
                 model, tScore90, tScore50, weightedMeanX, weightedVarX, mseWeighted, sumW);
             
-            return {
-                chart,
-                maxId,
-                maxDateOrdinal,
-                allMeanData,
-                allL90Data,
-                allH90Data,
-                allL50Data,
-                allH50Data,
-                avgDailyCount,
-                numericToOriginalId,
-                generatePredictions,  // Функція для регенерації
-                minHistoricalId,
-                nextWorkingTime,
-                earliestHistoricalTime
-            };
+            if (chart.pendingFreezeId && chart.freezeAtId) {
+                setTimeout(() => {
+                    chart.freezeAtId(chart, chart.pendingFreezeId);
+                    delete chart.pendingFreezeId;
+                }, 100);
+            }
+            
+            return chart;
         }
 
         function renderChart(regularPoints, liveQueuePoints, histRanges, preBookedData, migratedData,
@@ -1212,178 +1302,6 @@
             return chart;
         }
 
-        function updateChartWithPreBookedData(chartData, preBookedRecords, migratedData) {
-            if (!chartData || !chartData.chart || !preBookedRecords) return;
-
-            const chart = chartData.chart;
-            const maxId = chartData.maxId;
-            const maxDateOrdinal = chartData.maxDateOrdinal;
-            const avgDailyCount = chartData.avgDailyCount || 0;
-            
-            let globalMaxId = maxId;
-            const preBookedData = [];
-
-            preBookedRecords.forEach(row => {
-                const idStr = String(row['ID'] || '').trim();
-                const dateStr = String(row['Дата'] || '').trim();
-                
-                // Приймаємо ID з цифрами (включно з "4794/4")
-                if (!idStr || !/^\d{4}(\/\d)?/.test(idStr)) return;
-
-                // Конвертуємо в numeric для chart plotting
-                const idNumeric = idToNumeric(idStr);
-                if (idNumeric === null || isNaN(idNumeric)) return;
-
-                if (idNumeric > globalMaxId) globalMaxId = idNumeric;
-
-                const date = parseDate(dateStr);
-                if (date) {
-                    // Зберігаємо обидва формати
-                    preBookedData.push({ id: idStr, idNumeric, date: date });
-                }
-            });
-
-            // Регенеруємо прогнозні лінії до максимального ID з попередніх записів
-            if (globalMaxId > chartData.maxId) {
-                console.log('Extending predictions to', globalMaxId);
-                const extendedPredPoints = chartData.generatePredictions(chartData.minHistoricalId, globalMaxId + 100, true);
-                
-                const allMeanData = extendedPredPoints.map(p => ({ 
-                    x: p.mean, 
-                    y: p.id,
-                    id: numericToId(p.id)
-                }));
-                const allL90Data = extendedPredPoints.map(p => ({ x: p.l90, y: p.id }));
-                const allH90Data = extendedPredPoints.map(p => ({ x: p.h90, y: p.id }));
-                const allL50Data = extendedPredPoints.map(p => ({ x: p.l50, y: p.id }));
-                const allH50Data = extendedPredPoints.map(p => ({ x: p.h50, y: p.id }));
-                
-                chartData.allMeanData = allMeanData;
-                chartData.allL90Data = allL90Data;
-                chartData.allH90Data = allH90Data;
-                chartData.allL50Data = allL50Data;
-                chartData.allH50Data = allH50Data;
-                
-                // Фільтруємо для відображення
-                const filterFutureOnly = (arr) => arr.filter(p => p.x.getTime() >= chartData.nextWorkingTime);
-                const filterFromEarliest = (arr) => arr.filter(p => p.x.getTime() >= chartData.earliestHistoricalTime);
-
-                const meanData = filterFromEarliest(allMeanData);
-                const l90Data = filterFutureOnly(allL90Data);
-                const h90Data = filterFutureOnly(allH90Data);
-                const l50Data = filterFutureOnly(allL50Data);
-                const h50Data = filterFutureOnly(allH50Data);
-                
-                // Оновлюємо datasets
-                const meanDataset = chart.data.datasets.find(ds => ds.label === 'Прогноз (50% Шанс)');
-                if (meanDataset) meanDataset.data = meanData;
-                
-                const l90Dataset = chart.data.datasets.find(ds => ds.label === '5% Шанс');
-                if (l90Dataset) l90Dataset.data = l90Data;
-                
-                const h90Dataset = chart.data.datasets.find(ds => ds.label === '95% Шанс');
-                if (h90Dataset) h90Dataset.data = h90Data;
-                
-                const l50Dataset = chart.data.datasets.find(ds => ds.label === '25% Шанс');
-                if (l50Dataset) l50Dataset.data = l50Data;
-                
-                const h50Dataset = chart.data.datasets.find(ds => ds.label === '75% Шанс');
-                if (h50Dataset) h50Dataset.data = h50Data;
-            }
-
-            // Використовуємо STRING ID для порівняння
-            const preBookedIds = new Set(preBookedData.map(d => d.id));
-            
-            let earliestPreBookedDate = null;
-            if (preBookedData.length > 0) {
-                preBookedData.sort((a, b) => a.date - b.date);
-                earliestPreBookedDate = preBookedData[0].date;
-            }
-            
-            const actualMigratedData = [];
-            if (migratedData && migratedData.migratedIds && earliestPreBookedDate) {
-                migratedData.migratedIds.forEach(id => {
-                    // migratedIds містить STRING ID
-                    if (!preBookedIds.has(id)) {
-                        const idNumeric = idToNumeric(id);
-                        if (idNumeric !== null && !isNaN(idNumeric)) {
-                            actualMigratedData.push({ 
-                                id: id, 
-                                idNumeric: idNumeric, 
-                                date: earliestPreBookedDate 
-                            });
-                        }
-                    }
-                });
-            }
-
-            const allScheduledData = [...preBookedData, ...actualMigratedData];
-
-            if (allScheduledData.length > 0) {
-                allScheduledData.sort((a, b) => a.date - b.date);
-                
-                const nextDate = allScheduledData[0].date;
-                const count = allScheduledData.filter(d => d.date.getTime() === nextDate.getTime()).length;
-                
-                const dateStr = nextDate.toLocaleDateString('uk-UA', { day: 'numeric', month: 'long' });
-                
-                const infoDiv = document.getElementById('next-day-info');
-                if (infoDiv) {
-                    infoDiv.textContent = `На найближчу дату (${dateStr}) записано: ${count} осіб`;
-                }
-
-                const statsDiv = document.getElementById('stats-info');
-                if (statsDiv) {
-                    statsDiv.textContent = `(Середнє "Зайшов" за 10 днів: ~${avgDailyCount})`;
-                }
-            }
-
-            const lastHistoricalDateOrdinal = maxDateOrdinal;
-            const cutoffOrdinal = lastHistoricalDateOrdinal + 65;
-            
-            const filteredPreBookedData = preBookedData.filter(d => {
-                const ord = toOrdinal(d.date);
-                return ord <= cutoffOrdinal;
-            });
-
-            const filteredMigratedData = actualMigratedData.filter(d => {
-                const ord = toOrdinal(d.date);
-                return ord <= cutoffOrdinal;
-            });
-
-            const preBookedChartData = filteredPreBookedData.map(d => ({ 
-                x: d.date, 
-                y: d.idNumeric,
-                id: d.id 
-            }));
-            const migratedChartData = filteredMigratedData.map(d => ({ 
-                x: d.date, 
-                y: d.idNumeric,
-                id: d.id 
-            }));
-            
-            const preBookedDataset = chart.data.datasets.find(ds => ds.label === 'Попередньо записані');
-            if (preBookedDataset) {
-                preBookedDataset.data = preBookedChartData;
-            }
-
-            const migratedDataset = chart.data.datasets.find(ds => ds.label === 'Перенесені');
-            if (migratedDataset) {
-                migratedDataset.data = migratedChartData;
-            }
-
-            chart.update();
-            
-            if (chart.pendingFreezeId && chart.freezeAtId) {
-                console.log('Executing pending freeze for ID:', chart.pendingFreezeId);
-                console.log('Pre-booked data loaded:', preBookedChartData.length, 'points');
-                
-                setTimeout(() => {
-                    chart.freezeAtId(chart, chart.pendingFreezeId);
-                    delete chart.pendingFreezeId;
-                }, 100);
-            }
-        }
     </script>
 </body>
 </html>
