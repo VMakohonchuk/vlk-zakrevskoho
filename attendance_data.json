@@ -1,36 +1,6 @@
 {
   "attendance_points": [
     {
-      "date": "2025-07-23",
-      "id": "1900",
-      "is_live": false
-    },
-    {
-      "date": "2025-07-23",
-      "id": "1910",
-      "is_live": false
-    },
-    {
-      "date": "2025-07-23",
-      "id": "1912",
-      "is_live": false
-    },
-    {
-      "date": "2025-07-23",
-      "id": "1988",
-      "is_live": false
-    },
-    {
-      "date": "2025-07-23",
-      "id": "1992",
-      "is_live": false
-    },
-    {
-      "date": "2025-07-23",
-      "id": "2001",
-      "is_live": false
-    },
-    {
       "date": "2025-07-24",
       "id": "1700",
       "is_live": false
@@ -4544,7 +4514,82 @@
       "date": "2025-12-09",
       "id": "4261",
       "is_live": false
+    },
+    {
+      "date": "2025-12-10",
+      "id": "3951",
+      "is_live": false
+    },
+    {
+      "date": "2025-12-10",
+      "id": "4107",
+      "is_live": false
+    },
+    {
+      "date": "2025-12-10",
+      "id": "4156",
+      "is_live": false
+    },
+    {
+      "date": "2025-12-10",
+      "id": "4162",
+      "is_live": false
+    },
+    {
+      "date": "2025-12-10",
+      "id": "4222",
+      "is_live": false
+    },
+    {
+      "date": "2025-12-10",
+      "id": "4230",
+      "is_live": false
+    },
+    {
+      "date": "2025-12-10",
+      "id": "4263",
+      "is_live": false
+    },
+    {
+      "date": "2025-12-10",
+      "id": "4271",
+      "is_live": false
+    },
+    {
+      "date": "2025-12-10",
+      "id": "4319",
+      "is_live": false
+    },
+    {
+      "date": "2025-12-10",
+      "id": "4340",
+      "is_live": false
+    },
+    {
+      "date": "2025-12-10",
+      "id": "4341",
+      "is_live": true
+    },
+    {
+      "date": "2025-12-10",
+      "id": "4346",
+      "is_live": true
+    },
+    {
+      "date": "2025-12-10",
+      "id": "4374",
+      "is_live": true
+    },
+    {
+      "date": "2025-12-10",
+      "id": "4404",
+      "is_live": true
+    },
+    {
+      "date": "2025-12-10",
+      "id": "4581",
+      "is_live": true
     }
   ],
-  "total_points": 909
+  "total_points": 918
 }
