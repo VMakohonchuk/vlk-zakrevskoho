@@ -2394,7 +2394,7 @@ def main() -> None:
     # Запускаємо кожні 30 хвилин. Сама функція перевірить, чи час підходить.
     application.job_queue.run_repeating(
         callback=notify_status,
-        interval=datetime.timedelta(minutes=5),
+        interval=datetime.timedelta(minutes=30),
         first=datetime.time(hour=7, minute=3, tzinfo=kyiv_tz), # Перший запуск о 7:00
         last=datetime.time(hour=23, minute=33, tzinfo=kyiv_tz), # Останній запуск о 23:30
         name="Status Change Notification"
