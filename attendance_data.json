@@ -4479,7 +4479,12 @@
       "date": "2025-12-17",
       "id": "4501",
       "is_live": false
+    },
+    {
+      "date": "2025-12-17",
+      "id": "4543",
+      "is_live": true
     }
   ],
-  "total_points": 896
+  "total_points": 897
 }
