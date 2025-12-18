@@ -2,6 +2,7 @@ import telegram
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     CommandHandler,
     MessageHandler,
     filters,
@@ -9,7 +10,6 @@ from telegram.ext import (
     ConversationHandler,
     CallbackQueryHandler,
 )
-from telegram.error import TimedOut
 from httpx import ConnectError
 import pandas as pd
 import datetime
@@ -19,15 +19,12 @@ import locale
 import re # Для перевірки формату ID
 import logging # Для журналу
 import configparser
+from functools import wraps
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from apscheduler.schedulers.asyncio import AsyncIOScheduler # Для асинхронних ботів
-from apscheduler.triggers.cron import CronTrigger
 import asyncio # Якщо ви ще не імпортували для асинхронності
-import signal # Імпортуємо модуль signal
 from pytz import timezone # pip install pytz
-import numpy as np
 from scipy import stats
 
 DEBUG = False
@@ -54,11 +51,24 @@ ADMIN_IDS = []
 GROUP_ID = ""
 STATUS_FILE = ""
 BANLIST = []
+ENVIRONMENT = "production"
 SERVICE_ACCOUNT_KEY_PATH = ""
 SPREADSHEET_ID = ""
 SHEET_NAME = ""
 STATS_SHEET_ID = ""
 STATS_WORKSHEET_NAME = ""
+ACTIVE_SHEET_ID = ""
+ACTIVE_WORKSHEET_NAME = ""
+
+# Callback patterns для опитування
+POLL_CONFIRM = "poll_confirm"
+POLL_RESCHEDULE = "poll_reschedule"
+POLL_CANCEL = "poll_cancel"
+POLL_DATE = "poll_date"
+POLL_DATE_OTHER = "poll_date_other"
+POLL_CANCEL_CONFIRM = "poll_cancel_confirm"
+POLL_CANCEL_ABORT = "poll_cancel_abort"
+POLL_CANCEL_RESCHEDULE = "poll_cancel_reschedule"
 
 # Глобальні змінні для Google Sheets
 SERVICE_ACCOUNT_SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
@@ -86,9 +96,10 @@ def save_config():
         config.write(configfile)
 
 def initialize_bot():
-    global TOKEN, ADMIN_IDS, GROUP_ID, STATUS_FILE, BANLIST
+    global TOKEN, ADMIN_IDS, GROUP_ID, STATUS_FILE, BANLIST, ENVIRONMENT
     global SERVICE_ACCOUNT_KEY_PATH, SPREADSHEET_ID, SHEET_NAME
     global STATS_SHEET_ID, STATS_WORKSHEET_NAME
+    global ACTIVE_SHEET_ID, ACTIVE_WORKSHEET_NAME
     global SHEETS_SERVICE, CREDS, queue_df
 
     try:
@@ -114,12 +125,17 @@ def initialize_bot():
         # Оновлюємо ADMIN_IDS як список цілих чисел
         BANLIST = [int(id_str.strip()) for id_str in ban_ids_str.split(',') if id_str.strip()]    
 
+        # ENVIRONMENT: test або production
+        ENVIRONMENT = config['BOT_SETTINGS'].get('ENVIRONMENT', 'production').strip().lower()
+
         # Отримуємо значення з секції GOOGLE_SHEETS
         SERVICE_ACCOUNT_KEY_PATH = config['GOOGLE_SHEETS']['SERVICE_ACCOUNT_KEY_PATH']
         SPREADSHEET_ID = config['GOOGLE_SHEETS']['SPREADSHEET_ID']
         SHEET_NAME = config['GOOGLE_SHEETS']['SHEET_NAME']
         STATS_SHEET_ID = config['GOOGLE_SHEETS']['STATS_SHEET_ID']
         STATS_WORKSHEET_NAME = config['GOOGLE_SHEETS']['STATS_WORKSHEET_NAME']
+        ACTIVE_SHEET_ID = config['GOOGLE_SHEETS']['ACTIVE_SHEET_ID']
+        ACTIVE_WORKSHEET_NAME = config['GOOGLE_SHEETS']['ACTIVE_WORKSHEET_NAME']
         
         logger.info("Константи успішно завантажено з config.ini")
 
@@ -339,14 +355,36 @@ def extract_main_id(id_string):
             return int(match.group())
     return None
 
-async def get_stats_data() -> pd.DataFrame | None:
+STATS_CACHE_TTL_MINUTES = 30
+
+async def get_stats_data(force_refresh: bool = False) -> pd.DataFrame | None:
     """
-    Завантажує дані з аркуша 'Stats' за допомогою Google Sheets API,
-    обробляє їх і повертає DataFrame.
+    Завантажує дані з аркуша 'Stats'.
+    Використовує локальний кеш з TTL 30 хвилин для зменшення навантаження на API.
+    
+    Args:
+        force_refresh: Примусово завантажити з API, ігноруючи кеш
     """
+    stats_cache_file = os.path.join(DAILY_SHEETS_CACHE_DIR, "_stats.csv")
+    
+    if not force_refresh and os.path.exists(stats_cache_file):
+        mod_time = datetime.datetime.fromtimestamp(os.path.getmtime(stats_cache_file))
+        age_minutes = (datetime.datetime.now() - mod_time).total_seconds() / 60
+        
+        if age_minutes < STATS_CACHE_TTL_MINUTES:
+            try:
+                stats_df = pd.read_csv(stats_cache_file)
+                if 'Останній номер що зайшов' in stats_df.columns:
+                    stats_df['Останній номер що зайшов'] = pd.to_numeric(stats_df['Останній номер що зайшов'], errors='coerce')
+                if 'Перший номер що зайшов' in stats_df.columns:
+                    stats_df['Перший номер що зайшов'] = pd.to_numeric(stats_df['Перший номер що зайшов'], errors='coerce')
+                stats_df['Дата прийому'] = pd.to_datetime(stats_df['Дата прийому'], format="%d.%m.%Y", dayfirst=True, errors='coerce')
+                logger.debug(f"Stats з кешу (вік: {age_minutes:.1f} хв)")
+                return stats_df
+            except Exception as e:
+                logger.warning(f"Помилка читання кешу stats: {e}, завантажуємо з API")
+    
     try:
-        # 1. Виконуємо запит до API для отримання даних
-        # Діапазон "A1:Z" гарантує, що ми отримаємо всі дані з аркуша
         range_name = f"{STATS_WORKSHEET_NAME}!A1:Z"
         result = SHEETS_SERVICE.spreadsheets().values().get(
             spreadsheetId=STATS_SHEET_ID, range=range_name
@@ -357,17 +395,19 @@ async def get_stats_data() -> pd.DataFrame | None:
         if not list_of_lists:
             logger.warning("Аркуш 'Stats' порожній.")
             return pd.DataFrame()
-        # 2. Перетворюємо список списків у DataFrame
+
         stats_df = pd.DataFrame(list_of_lists[1:], columns=list_of_lists[0])
-        # 3. Підготовка даних (перетворення типів)
+        
+        os.makedirs(DAILY_SHEETS_CACHE_DIR, exist_ok=True)
+        stats_df.to_csv(stats_cache_file, index=False)
+        logger.info(f"Stats завантажено з API та збережено в кеш ({len(stats_df)} рядків)")
+        
         if 'Останній номер що зайшов' in stats_df.columns:
             stats_df['Останній номер що зайшов'] = pd.to_numeric(stats_df['Останній номер що зайшов'], errors='coerce')
         if 'Перший номер що зайшов' in stats_df.columns:
             stats_df['Перший номер що зайшов'] = pd.to_numeric(stats_df['Перший номер що зайшов'], errors='coerce')
-            
         stats_df['Дата прийому'] = pd.to_datetime(stats_df['Дата прийому'], format="%d.%m.%Y", dayfirst=True, errors='coerce')
         
-        logger.info("Дані з аркуша 'Stats' успішно завантажено та оброблено.")
         return stats_df
 
     except HttpError as err:
@@ -462,20 +502,154 @@ def save_queue_data_full(df: pd.DataFrame) -> bool:
         return False
 
 
+def update_active_sheet_status(user_id: str, new_status: str) -> bool:
+    """
+    Оновлює статус для ID в колонці C (Статус) аркуша Active.
+    Статуси: 'Підтвердив візит', 'Відклав візит', 'Скасував'
+    """
+    if SHEETS_SERVICE is None:
+        logger.error("Google Sheets API не ініціалізовано. Неможливо оновити статус.")
+        return False
+    
+    try:
+        range_name = f"{ACTIVE_WORKSHEET_NAME}!A:D"
+        result = SHEETS_SERVICE.spreadsheets().values().get(
+            spreadsheetId=ACTIVE_SHEET_ID,
+            range=range_name
+        ).execute()
+        
+        values = result.get('values', [])
+        if not values:
+            logger.warning(f"Active sheet порожній")
+            return False
+        
+        row_index = None
+        for i, row in enumerate(values):
+            if len(row) >= 2 and str(row[1]).strip() == str(user_id).strip():
+                row_index = i
+                break
+        
+        if row_index is None:
+            logger.warning(f"ID {user_id} не знайдено в Active sheet")
+            return False
+        
+        cell_range = f"{ACTIVE_WORKSHEET_NAME}!C{row_index + 1}"
+        SHEETS_SERVICE.spreadsheets().values().update(
+            spreadsheetId=ACTIVE_SHEET_ID,
+            range=cell_range,
+            valueInputOption='USER_ENTERED',
+            body={'values': [[new_status]]}
+        ).execute()
+        
+        logger.info(f"Статус ID {user_id} оновлено на '{new_status}' в Active sheet")
+        return True
+        
+    except HttpError as err:
+        logger.error(f"Google API HttpError при оновленні статусу: {err.resp.status} - {err.content}")
+        return False
+    except Exception as e:
+        logger.error(f"Помилка оновлення статусу в Active sheet: {e}")
+        return False
+
+
+def get_sheets_list(spreadsheet_id: str) -> list:
+    """
+    Отримує список назв аркушів у таблиці.
+    """
+    if SHEETS_SERVICE is None:
+        logger.error("Google Sheets API не ініціалізовано.")
+        return []
+    
+    try:
+        spreadsheet = SHEETS_SERVICE.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+        sheets = spreadsheet.get('sheets', [])
+        return [sheet['properties']['title'] for sheet in sheets]
+    except HttpError as err:
+        logger.error(f"Google API HttpError при отриманні списку аркушів: {err.resp.status}")
+        return []
+    except Exception as e:
+        logger.error(f"Помилка отримання списку аркушів: {e}")
+        return []
+
+
+def get_users_for_date_from_active_sheet(target_date: str) -> list:
+    """
+    Отримує список користувачів з Active sheet, записаних на вказану дату.
+    Повертає список словників: [{'id': '123', 'tg_id': '456789', ...}, ...]
+    
+    Структура Active sheet: №, ID, Статус, Примітки, ... (права частина з TG ID)
+    """
+    if SHEETS_SERVICE is None:
+        logger.error("Google Sheets API не ініціалізовано.")
+        return []
+    
+    try:
+        range_name = f"{ACTIVE_WORKSHEET_NAME}!A:Z"
+        result = SHEETS_SERVICE.spreadsheets().values().get(
+            spreadsheetId=ACTIVE_SHEET_ID,
+            range=range_name
+        ).execute()
+        
+        values = result.get('values', [])
+        if len(values) < 3:
+            return []
+        
+        data_start_idx = None
+        for i, row in enumerate(values):
+            if len(row) > 0 and row[0].strip() == '№':
+                data_start_idx = i + 1
+                break
+        
+        if data_start_idx is None:
+            return []
+        
+        users = []
+        for row in values[data_start_idx:]:
+            if len(row) < 2:
+                continue
+            
+            number = row[0].strip() if len(row) > 0 else ''
+            user_id = row[1].strip() if len(row) > 1 else ''
+            
+            if not number or not user_id:
+                continue
+            
+            tg_id = ''
+            for col_idx in range(4, len(row)):
+                cell_value = str(row[col_idx]).strip()
+                if cell_value.isdigit() and len(cell_value) >= 6:
+                    tg_id = cell_value
+                    break
+            
+            users.append({
+                'id': user_id,
+                'tg_id': tg_id,
+                'number': number
+            })
+        
+        return users
+        
+    except HttpError as err:
+        logger.error(f"Google API HttpError при читанні Active sheet: {err.resp.status}")
+        return []
+    except Exception as e:
+        logger.error(f"Помилка читання Active sheet: {e}")
+        return []
+
 
 # --- СТАНДАРТНА КЛАВІАТУРА З КОМАНДАМИ ---
 # Важливо: хоча на кнопках текст, для внутрішньої логіки бот все ще реагує на цей текст як на "команду"
 BUTTON_TEXT_JOIN = "Записатися / Перенести"
 BUTTON_TEXT_SHOW = "Переглянути чергу"
 BUTTON_TEXT_CANCEL_RECORD = "Скасувати запис"
-BUTTON_TEXT_OPEN_SHEET = "Відкрити таблицю"
 BUTTON_TEXT_PREDICTION = "Прогноз черги"
 #BUTTON_TEXT_CLEAR_QUEUE = "Очистити чергу"
-BUTTON_TEXT_CANCEL_OP = "Скасувати ввід" # Для відміни поточної дії
+BUTTON_TEXT_CANCEL_OP = "Скасувати ввід"  # Для відміни поточної дії
 BUTTON_TEXT_STATUS = "Переглянути статус"
+# Кнопки для ConversationHandler перегляду черги
+BUTTON_TEXT_SHOW_ALL = "Показати всі записи"
+BUTTON_TEXT_SHOW_DATE = "Показати записи на конкретну дату"
 # Створюємо callback_data для кнопок
-CALLBACK_YES = "confirm_yes"
-CALLBACK_NO = "confirm_no"
 
 # Створюємо кнопки
 # Кнопка для запису або зміни дати відвідання
@@ -484,8 +658,6 @@ button_join = KeyboardButton(BUTTON_TEXT_JOIN)
 button_show = KeyboardButton(BUTTON_TEXT_SHOW)
 # Кнопка для скасування запису
 button_cancel_record = KeyboardButton(BUTTON_TEXT_CANCEL_RECORD)
-# Кнопка для скачування таблиці
-button_open_sheet = KeyboardButton(BUTTON_TEXT_OPEN_SHEET)
 # Кнопка для прогнозу черги
 button_prediction = KeyboardButton(BUTTON_TEXT_PREDICTION)
 # Кнопка для очищення черги(відображається для всіх, але працює лише для адмінів)
@@ -504,15 +676,15 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
 )
 '''
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
-    [[button_join, button_cancel_record], [button_status, button_show], [button_open_sheet, button_prediction]],
-    one_time_keyboard=False,  # Клавіатура залишається після використання
-    resize_keyboard=True      # Клавіатура буде меншого розміру
+    [[button_join, button_cancel_record], [button_status, button_show], [button_prediction]],
+    one_time_keyboard=False,
+    resize_keyboard=True
 )
 CANCEL_KEYBOARD = ReplyKeyboardMarkup([[KeyboardButton(BUTTON_TEXT_CANCEL_OP)]], one_time_keyboard=True, resize_keyboard=True)
 
 SHOW_OPTION_KEYBOARD = ReplyKeyboardMarkup([
-        [KeyboardButton("Показати всі записи")],
-        [KeyboardButton("Показати записи на конкретну дату")],
+        [KeyboardButton(BUTTON_TEXT_SHOW_ALL)],
+        [KeyboardButton(BUTTON_TEXT_SHOW_DATE)],
         [KeyboardButton(BUTTON_TEXT_CANCEL_OP)]],
         one_time_keyboard=True, resize_keyboard=True)
 
@@ -555,55 +727,194 @@ def calculate_end_date(start_date, days_count):
             added += 1
     return temp_date
 
-def date_keyboard(today = datetime.date.today(), days_to_check = 0, days_ahead = 15, start_date=None, end_date=None, prediction_dist=None) -> object:
-    # Генеруємо кнопки тільки для робочих днів
-    flat_keyboard_buttons = []
-    keyboard_buttons = []
-    chunk_size = 3 
+def generate_date_options(today=None, days_to_check=0, days_ahead=15, start_date=None, end_date=None, prediction_dist=None) -> list:
+    """
+    Генерує список дат для вибору з текстом кнопки та ймовірністю.
+    Повертає: [{'date': date_obj, 'text': 'Пн: 18.12.25 (75%)', 'date_str': '18.12.2025'}, ...]
+    """
+    if today is None:
+        today = datetime.date.today()
     
+    date_options = []
     current_check_date = today + datetime.timedelta(days=days_to_check)
     
+    logger.debug(f"generate_date_options: start_date={start_date}, end_date={end_date}, using_range={bool(start_date and end_date)}")
+    
     if start_date and end_date:
-        # Переконуємось, що start_date не раніше current_check_date
         iter_date = max(current_check_date, start_date)
         limit_date = end_date
         
-        # Генеруємо всі робочі дні в діапазоні
         while iter_date <= limit_date:
-             if iter_date.weekday() < 5:
-                 # Формуємо текст: "Пн: 25.12.25 (55%)" (день тижня, DD.MM.YY, %)
-                 date_str = iter_date.strftime("%d.%m.%y")
-                 weekday_str = get_ua_weekday(iter_date)
-                 button_text = f"{weekday_str}: {date_str}"
-                 
-                 if prediction_dist:
-                     percent = calculate_date_probability(iter_date, prediction_dist)
-                     if percent >= 0.1:
-                         button_text = f"{button_text} ({percent:.0f}%)"
-
-                 flat_keyboard_buttons.append(KeyboardButton(button_text))
-             iter_date += datetime.timedelta(days=1)
-             # Запобіжник: перериваємо, якщо кнопок забагато
-             if len(flat_keyboard_buttons) >= 30:
-                 break
+            if iter_date.weekday() < 5:
+                date_str_short = iter_date.strftime("%d.%m.%y")
+                date_str_full = iter_date.strftime("%d.%m.%Y")
+                weekday_str = get_ua_weekday(iter_date)
+                button_text = f"{weekday_str}: {date_str_short}"
+                
+                if prediction_dist:
+                    percent = calculate_date_probability(iter_date, prediction_dist)
+                    if percent >= 0.1:
+                        button_text = f"{button_text} ({percent:.0f}%)"
+                
+                date_options.append({
+                    'date': iter_date,
+                    'text': button_text,
+                    'date_str': date_str_full
+                })
+            iter_date += datetime.timedelta(days=1)
+            if len(date_options) >= 30:
+                break
     else:
         buttons_added = 0
         iter_date = current_check_date
         while buttons_added < days_ahead:
-            if iter_date.weekday() < 5: # Якщо це не субота (5) і не неділя (6)
-                date_str = iter_date.strftime("%d.%m.%y")
+            if iter_date.weekday() < 5:
+                date_str_short = iter_date.strftime("%d.%m.%y")
+                date_str_full = iter_date.strftime("%d.%m.%Y")
                 weekday_str = get_ua_weekday(iter_date)
-                button_text = f"{weekday_str}: {date_str}"
-                flat_keyboard_buttons.append(KeyboardButton(button_text))
+                button_text = f"{weekday_str}: {date_str_short}"
+                
+                if prediction_dist:
+                    percent = calculate_date_probability(iter_date, prediction_dist)
+                    if percent >= 0.1:
+                        button_text = f"{button_text} ({percent:.0f}%)"
+                
+                date_options.append({
+                    'date': iter_date,
+                    'text': button_text,
+                    'date_str': date_str_full
+                })
                 buttons_added += 1
             iter_date += datetime.timedelta(days=1)
     
-    # Додаємо кнопку "Скасувати ввід" до клавіатури вибору дати
-    keyboard_buttons.append([KeyboardButton(BUTTON_TEXT_CANCEL_OP)])
-    # Улаштовуємо кнопки в chunk_size стовпчиків
-    keyboard_buttons = [flat_keyboard_buttons[i:i + chunk_size] for i in range (0, len(flat_keyboard_buttons), chunk_size)]
-    keyboard_buttons.append([button_cancel_op]) # додаємо в кінець кнопку /cancel
-    return ReplyKeyboardMarkup(keyboard_buttons, one_time_keyboard=True, resize_keyboard=True)    
+    return date_options
+
+def date_keyboard(today=None, days_to_check=0, days_ahead=15, start_date=None, end_date=None, prediction_dist=None) -> ReplyKeyboardMarkup:
+    """
+    Створює ReplyKeyboardMarkup з датами.
+    Використовує generate_date_options() для генерації списку дат.
+    """
+    if today is None:
+        today = datetime.date.today()
+    
+    date_options = generate_date_options(today, days_to_check, days_ahead, start_date, end_date, prediction_dist)
+    
+    flat_keyboard_buttons = [KeyboardButton(opt['text']) for opt in date_options]
+    
+    chunk_size = 3
+    keyboard_buttons = [flat_keyboard_buttons[i:i + chunk_size] for i in range(0, len(flat_keyboard_buttons), chunk_size)]
+    keyboard_buttons.append([button_cancel_op])
+    
+    return ReplyKeyboardMarkup(keyboard_buttons, one_time_keyboard=True, resize_keyboard=True)
+
+def get_prediction_date_range(prediction: dict, today: datetime.date = None) -> tuple:
+    """
+    Обчислює діапазон дат з прогнозу.
+    
+    Returns:
+        (start_date, end_date, prediction_dist) - готові для передачі в date_keyboard
+    """
+    if prediction is None:
+        return None, None, None
+    
+    if today is None:
+        today = datetime.date.today()
+    
+    min_date = today + datetime.timedelta(days=1)
+    start_date = prediction.get('mean')
+    end_date = prediction.get('h90')
+    prediction_dist = prediction.get('dist')
+    
+    if start_date:
+        start_date = max(start_date, min_date)
+        while start_date.weekday() >= 5:
+            start_date += datetime.timedelta(days=1)
+        
+        if end_date and start_date > end_date:
+            start_date = min_date
+            while start_date.weekday() >= 5:
+                start_date += datetime.timedelta(days=1)
+            end_date = None
+    
+    return start_date, end_date, prediction_dist
+
+def date_keyboard_from_prediction(prediction: dict, today: datetime.date = None, days_ahead: int = 15) -> ReplyKeyboardMarkup:
+    """
+    Створює клавіатуру з датами на основі прогнозу.
+    Спрощена обгортка для date_keyboard з автоматичним обчисленням діапазону.
+    """
+    if today is None:
+        today = datetime.date.today()
+    
+    start_date, end_date, prediction_dist = get_prediction_date_range(prediction, today)
+    return date_keyboard(today, 1, days_ahead, start_date=start_date, end_date=end_date, prediction_dist=prediction_dist)
+
+def format_prediction_range_text(prediction: dict, today: datetime.date = None, days_ahead: int = 15) -> str:
+    """
+    Форматує текст діапазону прогнозу з ймовірностями.
+    Повертає рядок виду: "`30.11.2026` (54%) - `22.12.2026` (95%)"
+    """
+    if prediction is None:
+        return ""
+    
+    if today is None:
+        today = datetime.date.today()
+    
+    start_date, end_date, prediction_dist = get_prediction_date_range(prediction, today)
+    
+    if not start_date or not prediction_dist:
+        return ""
+    
+    try:
+        prob_start = calculate_date_probability(start_date, prediction_dist)
+        
+        if end_date:
+            prob_end = calculate_date_probability(end_date, prediction_dist)
+            end_str = f"`{end_date.strftime('%d.%m.%Y')}` ({prob_end:.0f}%)"
+        else:
+            est_end = calculate_end_date(start_date, days_ahead)
+            prob_end = calculate_date_probability(est_end, prediction_dist)
+            end_str = f"`{est_end.strftime('%d.%m.%Y')}` ({prob_end:.0f}%)"
+        
+        return f"`{start_date.strftime('%d.%m.%Y')}` ({prob_start:.0f}%) - {end_str}"
+    except Exception as e:
+        logger.error(f"Помилка форматування діапазону: {e}")
+        return f"`{prediction.get('mean', today).strftime('%d.%m.%Y')}` - `{prediction.get('h90', today).strftime('%d.%m.%Y')}`"
+
+def date_inline_keyboard_from_prediction(user_id: str, prediction: dict, today: datetime.date = None, days_ahead: int = 15, columns: int = 2) -> InlineKeyboardMarkup:
+    """
+    Створює InlineKeyboardMarkup з датами на основі прогнозу.
+    Спрощена обгортка для date_inline_keyboard.
+    """
+    if today is None:
+        today = datetime.date.today()
+    
+    start_date, end_date, prediction_dist = get_prediction_date_range(prediction, today)
+    return date_inline_keyboard(user_id, today, 1, days_ahead, start_date, end_date, prediction_dist, columns)
+
+def date_inline_keyboard(user_id: str, today=None, days_to_check=0, days_ahead=15, start_date=None, end_date=None, prediction_dist=None, columns=2) -> InlineKeyboardMarkup:
+    """
+    Створює InlineKeyboardMarkup з датами для опитування.
+    Використовує generate_date_options() для генерації списку дат.
+    Callback data: poll_date_{user_id}_{date_str}
+    """
+    if today is None:
+        today = datetime.date.today()
+    
+    date_options = generate_date_options(today, days_to_check, days_ahead, start_date, end_date, prediction_dist)
+    
+    flat_buttons = []
+    for opt in date_options:
+        callback_data = f"{POLL_DATE}_{user_id}_{opt['date_str']}"
+        flat_buttons.append(InlineKeyboardButton(opt['text'], callback_data=callback_data))
+    
+    keyboard_buttons = [flat_buttons[i:i + columns] for i in range(0, len(flat_buttons), columns)]
+    keyboard_buttons.append([
+        InlineKeyboardButton("Інша дата", callback_data=f"{POLL_DATE_OTHER}_{user_id}"),
+        InlineKeyboardButton("Скасувати", callback_data=f"{POLL_CANCEL_RESCHEDULE}_{user_id}")
+    ])
+    
+    return InlineKeyboardMarkup(keyboard_buttons)    
 
 
 # --- ДОПОМІЖНА ФУНКЦІЯ ПЕРЕВІРКИ АДМІНІСТРАТОРА ---
@@ -830,6 +1141,49 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             reply_markup=MAIN_KEYBOARD,
         )
 
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показує список доступних команд."""
+    user = update.effective_user
+    
+    user_commands = (
+        "<b>Команди для всіх користувачів:</b>\n"
+        "/start - Почати роботу з ботом\n"
+        "/help - Показати цю довідку\n\n"
+        "<b>Основні дії (кнопки):</b>\n"
+        "<code>Записатися / Перенести</code> - записатися або перенести дату\n"
+        "<code>Скасувати запис</code> - скасувати свій запис\n"
+        "<code>Переглянути статус</code> - статус вашої заявки\n"
+        "<code>Переглянути чергу</code> - переглянути чергу\n"
+        "<code>Прогноз черги</code> - графік ймовірності\n"
+        "<code>Скасувати ввід</code> - скасувати поточну дію"
+    )
+    
+    admin_commands = ""
+    if is_admin(user.id):
+        admin_commands = (
+            "\n\n<b>Команди адміністратора:</b>\n"
+            "/env - Показати оточення та команди запуску\n"
+            "/run_cleanup - Запустити очищення черги\n"
+            "/run_notify - Запустити перевірку статусів\n"
+            "/run_reminder - Запустити нагадування\n"
+            "/run_check_sheet - Перевірити новий аркуш\n"
+            "/run_poll - Надіслати опитування\n"
+            "/test_poll [ID] - Тестове опитування\n"
+            "/grant_admin ID - Додати адміністратора\n"
+            "/drop_admin ID - Видалити адміністратора\n"
+            "/ban ID - Заблокувати користувача\n"
+            "/unban ID - Розблокувати користувача\n"
+            "/sheet - Посилання на Google Sheets"
+        )
+    
+    await update.message.reply_text(
+        user_commands + admin_commands,
+        parse_mode="HTML",
+        reply_markup=MAIN_KEYBOARD
+    )
+
+
     # Функція, яка містить основну логіку очищення
 async def perform_queue_cleanup(logger_info_prefix: str = "Очищення за розкладом"):
     """
@@ -941,16 +1295,26 @@ async def clear_queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             reply_markup=MAIN_KEYBOARD
         )
 '''
+
+# --- ДЕКОРАТОР ДЛЯ ПЕРЕВІРКИ ПРАВ АДМІНІСТРАТОРА ---
+
+def admin_only(func):
+    """Декоратор для команд, доступних тільки адміністраторам."""
+    @wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        user = update.effective_user
+        if not is_admin(user.id):
+            logger.warning(f"Користувач {get_user_log_info(user)} без прав адміністратора спробував виконати {func.__name__}")
+            await update.message.reply_text("У вас недостатньо прав для виконання цієї команди.", reply_markup=MAIN_KEYBOARD)
+            return
+        return await func(update, context, *args, **kwargs)
+    return wrapper
+
+
+@admin_only
 async def open_sheet_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Відправляє користувачу посилання на Google Sheet."""
-    
     user = update.effective_user
-    user_id = user.id
-    
-    if not is_admin(user_id):
-        logger.warning(f"Користувач {get_user_log_info(user)} без прав адміністратора спробував отримати посилання на таблицю черги Google.")
-        await update.message.reply_text("У вас недостатньо прав для виконання цієї команди.", reply_markup=MAIN_KEYBOARD)
-        return
     # Перевіряємо, чи SHEETS_SERVICE ініціалізовано.
     if SHEETS_SERVICE is None:
         logger.error(f"Адміністратор {get_user_log_info(user)} спробував отримати посилання, але Google Sheets API не ініціалізовано.")
@@ -977,15 +1341,10 @@ async def prediction_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 # --- ФУНКЦІЇ ДЛЯ КЕРУВАННЯ АДМІНІСТРАТОРАМИ ---
 
+@admin_only
 async def grant_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Додає користувача до списку адміністраторів."""
     user = update.effective_user
-    requester_id = user.id
-
-    if not is_admin(requester_id):
-        logger.warning(f"Користувач {get_user_log_info(user)} без прав адміністратора спробував додати адміністратора.")
-        await update.message.reply_text("У вас недостатньо прав для виконання цієї команди.", reply_markup=MAIN_KEYBOARD)
-        return
     
     if not context.args:
         await update.message.reply_text(
@@ -1029,15 +1388,10 @@ async def grant_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             reply_markup=MAIN_KEYBOARD
         )
 
+@admin_only
 async def drop_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Видаляє користувача зі списку адміністраторів."""
     user = update.effective_user
-    requester_id = user.id
-
-    if not is_admin(requester_id):
-        logger.warning(f"Користувач {get_user_log_info(user)} без прав адміністратора спробував видалити адміністратора.")
-        await update.message.reply_text("У вас недостатньо прав для виконання цієї команди.", reply_markup=MAIN_KEYBOARD)
-        return
     
     if not context.args:
         await update.message.reply_text(
@@ -1051,7 +1405,7 @@ async def drop_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     try:
         admin_to_remove_id = int(context.args[0])
         
-        if admin_to_remove_id == requester_id:
+        if admin_to_remove_id == user.id:
             await update.message.reply_text(
                 "Ви не можете видалити самого себе з адміністраторів. Попросіть іншого адміністратора це зробити.",
                 reply_markup=MAIN_KEYBOARD
@@ -1091,15 +1445,10 @@ async def drop_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         
 # --- ФУНКЦІЇ ДЛЯ КЕРУВАННЯ СПИСКОМ ЗАБЛОКОВАНИХ ---
 
+@admin_only
 async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Додає користувача до списку заблокованих."""
     user = update.effective_user
-    requester_id = user.id
-
-    if not is_admin(requester_id):
-        logger.warning(f"Користувач {get_user_log_info(user)} без прав адміністратора спробував розширити список заблокованих.")
-        await update.message.reply_text("У вас недостатньо прав для виконання цієї команди.", reply_markup=MAIN_KEYBOARD)
-        return
     
     if not context.args:
         await update.message.reply_text(
@@ -1143,15 +1492,10 @@ async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             reply_markup=MAIN_KEYBOARD
         )
 
+@admin_only
 async def unban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Видаляє користувача зі списку заблокованих."""
     user = update.effective_user
-    requester_id = user.id
-
-    if not is_admin(requester_id):
-        logger.warning(f"Користувач {get_user_log_info(user)} без прав адміністратора спробував скоротити список заблокованих.")
-        await update.message.reply_text("У вас недостатньо прав для виконання цієї команди.", reply_markup=MAIN_KEYBOARD)
-        return
     
     if not context.args:
         await update.message.reply_text(
@@ -1165,7 +1509,7 @@ async def unban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         unban_id = int(context.args[0])
         
-        if unban_id == requester_id:
+        if unban_id == user.id:
             await update.message.reply_text(
                 "Ви не можете видалити самого себе з списку заблокованих. Попросіть іншого адміністратора це зробити.",
                 reply_markup=MAIN_KEYBOARD
@@ -1202,6 +1546,149 @@ async def unban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "Сталася помилка при розблокуванні користувача.",
             reply_markup=MAIN_KEYBOARD
         )
+
+
+@admin_only
+async def test_poll(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /test_poll [ID] - надсилає тестове опитування поточному користувачу.
+    Використовує Active sheet (TEMP) для пошуку ID користувача.
+    Якщо ID вказано в аргументі - використовує його, інакше шукає ID за TG ID користувача.
+    """
+    user = update.effective_user
+    requester_id = user.id
+    
+    user_id = None
+    
+    if context.args:
+        user_id = context.args[0]
+    else:
+        users = get_users_for_date_from_active_sheet('')
+        for u in users:
+            if u.get('tg_id') == str(requester_id):
+                user_id = u['id']
+                break
+    
+    if not user_id:
+        await update.message.reply_text(
+            "❌ ID не знайдено в Active sheet. Вкажіть ID явно: /test_poll 1234",
+            parse_mode="HTML"
+        )
+        return
+    
+    next_working_days = get_next_working_days(1)
+    test_date = next_working_days[0].strftime("%d.%m.%Y") if next_working_days else "Тестова дата"
+    
+    context.bot_data['next_reception_sheet'] = test_date
+    context.bot_data['next_reception_date'] = next_working_days[0] if next_working_days else datetime.date.today()
+    
+    await context.bot.send_message(
+        chat_id=requester_id,
+        text=f"<b>ТЕСТОВЕ</b> {get_poll_text(user_id, test_date)}",
+        reply_markup=get_poll_keyboard(user_id),
+        parse_mode="HTML"
+    )
+    
+    logger.info(f"Тестове опитування надіслано адміністратору {get_user_log_info(user)} з ID: {user_id}")
+
+
+# --- КОМАНДИ ДЛЯ РУЧНОГО ЗАПУСКУ ЗАПЛАНОВАНИХ ЗАВДАНЬ ---
+
+async def run_scheduled_job(update: Update, context: ContextTypes.DEFAULT_TYPE, 
+                            job_func, job_name: str, result_handler=None) -> None:
+    """Універсальна функція для ручного запуску scheduled jobs."""
+    user = update.effective_user
+    logger.info(f"Адміністратор {get_user_log_info(user)} запустив: {job_name}")
+    await update.message.reply_text(f"Запускаю {job_name}...")
+    
+    result = await job_func(context) if asyncio.iscoroutinefunction(job_func) else job_func(context)
+    
+    if result_handler:
+        response = result_handler(result, context)
+    else:
+        response = f"{job_name} завершено."
+    
+    await update.message.reply_text(response, reply_markup=MAIN_KEYBOARD)
+
+
+@admin_only
+async def run_cleanup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ручний запуск очищення черги."""
+    user = update.effective_user
+    logger.info(f"Адміністратор {get_user_log_info(user)} запустив: очищення черги")
+    await update.message.reply_text("Запускаю очищення черги...")
+    
+    removed_count = await perform_queue_cleanup(logger_info_prefix=f"Ручний запуск (адмін {user.id})")
+    
+    if removed_count == -1:
+        await update.message.reply_text("Помилка під час очищення черги.", reply_markup=MAIN_KEYBOARD)
+    else:
+        await update.message.reply_text(f"Очищення завершено. Видалено {removed_count} записів.", reply_markup=MAIN_KEYBOARD)
+
+
+@admin_only
+async def run_notify_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ручний запуск перевірки статусів."""
+    await run_scheduled_job(update, context, notify_status, "перевірку статусів")
+
+
+@admin_only
+async def run_reminder_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ручний запуск нагадувань."""
+    await run_scheduled_job(update, context, date_reminder, "нагадування")
+
+
+@admin_only
+async def run_check_sheet_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ручний запуск перевірки нового аркуша."""
+    user = update.effective_user
+    logger.info(f"Адміністратор {get_user_log_info(user)} запустив: перевірку аркуша")
+    await update.message.reply_text("Запускаю перевірку нового аркуша...")
+    
+    await check_new_daily_sheet(context)
+    
+    next_sheet = context.bot_data.get('next_reception_sheet', 'не знайдено')
+    detected_at = context.bot_data.get('sheet_detected_at')
+    poll_sent = context.bot_data.get('poll_sent_for_date')
+    
+    status_msg = f"Перевірку завершено.\nНаступний аркуш: {next_sheet}"
+    if detected_at:
+        status_msg += f"\nВиявлено о: {detected_at.strftime('%H:%M:%S')}"
+    if poll_sent:
+        status_msg += f"\nОпитування надіслано: {poll_sent}"
+    
+    await update.message.reply_text(status_msg, reply_markup=MAIN_KEYBOARD)
+
+
+@admin_only
+async def run_poll_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ручний запуск опитування."""
+    next_sheet = context.bot_data.get('next_reception_sheet')
+    if not next_sheet:
+        await update.message.reply_text("Аркуш наступного прийомного дня не виявлено. Спочатку запустіть /run_check_sheet", reply_markup=MAIN_KEYBOARD)
+        return
+    
+    await run_scheduled_job(update, context, send_visit_poll, f"опитування для дати {next_sheet}")
+
+
+@admin_only
+async def show_environment_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показує поточне оточення бота."""
+    scheduled_status = "вимкнено" if ENVIRONMENT == "test" else "увімкнено"
+    
+    await update.message.reply_text(
+        f"<b>Оточення:</b> <code>{ENVIRONMENT}</code>\n"
+        f"<b>Заплановані завдання:</b> {scheduled_status}\n\n"
+        f"<b>Команди для ручного запуску:</b>\n"
+        f"/run_cleanup - очищення черги\n"
+        f"/run_notify - перевірка статусів\n"
+        f"/run_reminder - нагадування\n"
+        f"/run_check_sheet - перевірка аркуша\n"
+        f"/run_poll - надіслати опитування",
+        parse_mode="HTML",
+        reply_markup=MAIN_KEYBOARD
+    )
+
 
 # --- ФУНКЦІЇ ДЛЯ РОЗМОВИ ЗАПИСУ В ЧЕРГУ (BUTTON_TEXT_JOIN) ---
 
@@ -1309,53 +1796,9 @@ async def join_get_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         prediction_text = ""
         if prediction:
             context.user_data['prediction_bounds'] = prediction
-            dist = prediction['dist']
-            
-            # Обчислюємо ймовірності для меж діапазону
-            try:
-                # Визначаємо фактичну дату початку (враховуючи 'завтра' та вихідні)
-                start_date_candidate = prediction['mean']
-                min_date = today + datetime.timedelta(days=1)
-                
-                actual_start_date = max(start_date_candidate, min_date)
-                
-                # Переходимо до наступного робочого дня, якщо потрібно
-                while actual_start_date.weekday() >= 5:
-                     actual_start_date += datetime.timedelta(days=1)
-                
-                # Якщо початкова дата ПІЗНІШЕ кінцевої дати (наприклад, малий ID, прогноз у минулому),
-                # ми повинні просто показати наступні N доступних днів, починаючи з завтра
-                if actual_start_date > prediction['h90']:
-                     actual_start_date = min_date
-                     while actual_start_date.weekday() >= 5:
-                         actual_start_date += datetime.timedelta(days=1)
-                     # Примусово встановлюємо кінцеву дату None, щоб date_keyboard згенерувала N днів наперед
-                     calc_end_date = None
-                else:
-                     calc_end_date = prediction['h90']
-
-                prob_start = calculate_date_probability(actual_start_date, dist)
-                if calc_end_date:
-                    prob_h90 = calculate_date_probability(calc_end_date, dist)
-                    end_date_str = f"`{calc_end_date.strftime('%d.%m.%Y')}` ({prob_h90:.0f}%)"
-                else:
-                    est_end_date = calculate_end_date(actual_start_date, days_ahead)
-                    prob_end = calculate_date_probability(est_end_date, dist)
-                    end_date_str = f"`{est_end_date.strftime('%d.%m.%Y')}` ({prob_end:.0f}%)"
-
-                range_info = f"`{actual_start_date.strftime('%d.%m.%Y')}` ({prob_start:.0f}%) - {end_date_str}"
-            except Exception as e:
-                logger.error(f"Помилка обчислення ймовірностей діапазону: {e}")
-                range_info = f"`{prediction['mean'].strftime('%d.%m.%Y')}` - `{prediction['h90'].strftime('%d.%m.%Y')}`"
-                calc_end_date = prediction['h90']
-
-            # Відображаємо діапазон
-            DATE_KEYBOARD = date_keyboard(today, 1, days_ahead, start_date=actual_start_date, end_date=calc_end_date, prediction_dist=prediction.get('dist'))
-            
-            # Додаємо інформацію до повідомлення
-            prediction_text = (
-                f"{range_info}. *Відсоток означає ймовірність того, що ви зможете почати ВЛК в цей день.*"
-            )
+            range_info = format_prediction_range_text(prediction, today, days_ahead)
+            DATE_KEYBOARD = date_keyboard_from_prediction(prediction, today, days_ahead)
+            prediction_text = f"{range_info}. *Відсоток означає ймовірність того, що ви зможете почати ВЛК в цей день.*"
         else:
             context.user_data.pop('prediction_bounds', None)
             DATE_KEYBOARD = date_keyboard(today, 1, days_ahead)
@@ -1420,26 +1863,26 @@ async def join_get_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     current_date_obj = datetime.date.today()
 
+    prediction = context.user_data.get('prediction_bounds')
+
     # Перевірка, чи дата поточна або пізніша 
     if chosen_date <= current_date_obj:
         logger.warning(f"Користувач {get_user_log_info(update.effective_user)} ввів дату раніше ніж наступний робочий день: '{date_input}'")
-        DATE_KEYBOARD=date_keyboard(current_date_obj, 1, days_ahead)
         await update.message.reply_text(
             f"Дата повинна бути пізнішою за поточну (`{current_date_obj.strftime('%d.%m.%Y')}`). Будь ласка, спробуйте ще раз або скасуйте дію.",
             parse_mode='Markdown',
-            reply_markup=DATE_KEYBOARD
+            reply_markup=date_keyboard_from_prediction(prediction, current_date_obj, days_ahead)
         )
         return JOIN_GETTING_DATE
     
     # ПЕРЕВІРКА: чи є обрана дата вихідним днем (субота або неділя)
-    if chosen_date.weekday() >= 5: # 5 - субота, 6 - неділя
+    if chosen_date.weekday() >= 5:
         logger.warning(f"Користувач {get_user_log_info(update.effective_user)} ввів вихідний день: '{date_input}'")
-        DATE_KEYBOARD=date_keyboard(current_date_obj, 1, days_ahead)
         await update.message.reply_html(
             "Ви обрали вихідний день (Субота або Неділя). Будь ласка, оберіть <code>робочий день</code> (Понеділок - П'ятниця) або скасуйте дію.",
-            reply_markup=DATE_KEYBOARD
+            reply_markup=date_keyboard_from_prediction(prediction, current_date_obj, days_ahead)
         )
-        return JOIN_GETTING_DATE # Залишаємося в тому ж стані
+        return JOIN_GETTING_DATE
 
     # ПЕРЕВІРКА: чи дата співпадає з поточною датою запису
     if previous_state:
@@ -1447,13 +1890,12 @@ async def join_get_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             previous_date_obj = datetime.datetime.strptime(previous_state, "%d.%m.%Y").date()
             if chosen_date == previous_date_obj:
                 logger.warning(f"Користувач {get_user_log_info(update.effective_user)} ввів дату, що співпадає з попереднім записом: '{chosen_date.strftime('%d.%m.%Y')}'")
-                DATE_KEYBOARD=date_keyboard(current_date_obj, 1, days_ahead)
                 await update.message.reply_text(
                     f"Дата не повинна співпадати з поточною датою запису (`{chosen_date.strftime('%d.%m.%Y')}`). Будь ласка, оберіть іншу дату або скасуйте дію.",
                     parse_mode='Markdown',
-                    reply_markup=DATE_KEYBOARD
+                    reply_markup=date_keyboard_from_prediction(prediction, current_date_obj, days_ahead)
                 )
-                return JOIN_GETTING_DATE # Залишаємося в тому ж стані
+                return JOIN_GETTING_DATE
         except ValueError:
             logger.warning(f"Не вдалося розпарсити попередню дату: '{previous_state}'")        
 
@@ -1535,30 +1977,10 @@ async def join_get_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
                 context.user_data['warning_shown'] = True
                 context.user_data['warned_date'] = chosen_date.strftime("%d.%m.%Y")
                 
-                today = datetime.date.today()
-                
-                # Determine the actual start date for the recommended range (max of mean prediction or tomorrow)
-                start_date_candidate = prediction['mean']
-                min_date = today + datetime.timedelta(days=1)
-                actual_start_date = max(start_date_candidate, min_date)
-                while actual_start_date.weekday() >= 5:
-                        actual_start_date += datetime.timedelta(days=1)
-
-                # If start date is > end date, we need to fallback to N days logic
-                if actual_start_date > prediction['h90']:
-                     actual_start_date = min_date
-                     while actual_start_date.weekday() >= 5:
-                         actual_start_date += datetime.timedelta(days=1)
-                     calc_end_date = None
-                else:
-                     calc_end_date = prediction['h90']
-
-                DATE_KEYBOARD = date_keyboard(today, 1, days_ahead, start_date=actual_start_date, end_date=calc_end_date, prediction_dist=prediction.get('dist'))
-                
                 await update.message.reply_text(
                     f"{warn_msg}\n\nЯкщо ви бажаєте залишити цю дату, введіть її ще раз або натисніть кнопку щоб обрати одну з рекомендованих.",
                     parse_mode='Markdown',
-                    reply_markup=DATE_KEYBOARD
+                    reply_markup=date_keyboard_from_prediction(prediction)
                 )
                 return JOIN_GETTING_DATE
             else:
@@ -1846,13 +2268,13 @@ async def show_get_option(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     """Отримує опцію відображення (всі або конкретна дата)."""
     choice = update.message.text.strip()
 
-    if choice == "Показати всі записи":
+    if choice == BUTTON_TEXT_SHOW_ALL:
         logger.info(f"Користувач {get_user_log_info(update.effective_user)} обрав перегляд усіх записів.")
         # Передаємо весь DataFrame до display_queue_data, яка сама відфільтрує актуальні
         await display_queue_data(update, queue_df, title="Усі записи в черзі зі статусом \"Ухвалено\":", reply_markup=MAIN_KEYBOARD)
         context.user_data.clear() # Очищуємо тимчасові дані
         return ConversationHandler.END
-    elif choice == "Показати записи на конкретну дату":
+    elif choice == BUTTON_TEXT_SHOW_DATE:
         logger.info(f"Користувач {get_user_log_info(update.effective_user)} обрав перегляд записів на конкретну дату.")
 
         today = datetime.date.today()
@@ -2094,14 +2516,12 @@ async def date_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
         prev_date = row['Попередня дата']
         tg_id = row['TG ID']
         remind = False
-        poll_confirm = False
+        nr_days = ''
      
-        # Перевіряємо дати запису
         if target_date_dt == current_date_obj:
             remind = True
             nr_days = 'на сьогодні'        
         if target_date_dt == one_day_later:
-            poll_confirm = False # тимчасово відключаємо підтвердження візиту (голосування) поки не зробимо повний список на завтра
             remind = True
             nr_days = 'на завтра'
         if target_date_dt == three_days_later:
@@ -2114,36 +2534,144 @@ async def date_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
             notification_text = f"{emo}<code>Нагадування!</code>\n  Для вашого номеру <code>{user_id}</code> призначено візит {nr_days}: <code>{target_date}</code>"
             notification_warning = f'\nПримітка: <code>{note}</code>' if note !='' else ''
             notification = notification_text+notification_warning
-            # Надсилаємо сповіщення в групу
-            #await send_group_notification(context, notification)
             # Надсилаємо особисте повідомлення користувачу
             await send_user_notification(context, tg_id, notification)
- 
-        if poll_confirm and current_status == 'Ухвалено' and tg_id != '':
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Так", callback_data=f"{CALLBACK_YES}_{user_id}")],
-                [InlineKeyboardButton("❌ Ні", callback_data=f"{CALLBACK_NO}_{user_id}")]
-            ])
-            try:
-                message = await context.bot.send_message(
-                    chat_id=tg_id,
-                    text=f"<b>Підтвердження візиту.\nВаш номер в списку первинної черги:</b> <code>{user_id}</code>\n\n"
-                         "Ви підтверджуєте свій візит на завтра?",
-                    reply_markup=keyboard,
-                    parse_mode="HTML"
-                )
-                # Зберігаємо ID повідомлення для подальшого видалення
-                context.job_queue.run_once(
-                    callback=delete_confirmation_message,
-                    when=datetime.time(hour=23, minute=45),
-                    data={'chat_id': tg_id, 'message_id': message.message_id}
-                )
-                logger.info(f"Опитування відправлено користувачу ID: {tg_id}")
-            except Exception as e:
-                logger.error(f"Не вдалося відправити опитування користувачу ID {tg_id}: {e}")
 
     logger.info("Завершення процедури нагадування і підтвердження дати візиту.")
+
+
+def get_next_working_days(count: int = 3) -> list:
+    """
+    Повертає список наступних робочих днів (без вихідних).
+    """
+    result = []
+    current = datetime.date.today() + datetime.timedelta(days=1)
+    while len(result) < count:
+        if current.weekday() < 5:
+            result.append(current)
+        current += datetime.timedelta(days=1)
+    return result
+
+
+async def check_new_daily_sheet(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Перевіряє чи з'явився аркуш з датою наступного прийомного дня.
+    Якщо так - зберігає час виявлення та назву аркуша в context.bot_data.
+    Якщо минуло 30 хвилин після виявлення - запускає опитування.
+    """
+    logger.info("Перевірка появи нового щоденного аркуша...")
     
+    if context.bot_data.get('poll_sent_for_date'):
+        today = datetime.date.today()
+        if context.bot_data['poll_sent_for_date'] == today:
+            logger.debug("Опитування вже надіслано сьогодні, пропускаємо перевірку")
+            return
+    
+    existing_sheets = get_sheets_list(STATS_SHEET_ID)
+    if not existing_sheets:
+        logger.warning("Не вдалося отримати список аркушів")
+        return
+    
+    next_working_days = get_next_working_days(3)
+    
+    found_sheet = None
+    found_date = None
+    for work_day in next_working_days:
+        sheet_name = work_day.strftime("%d.%m.%Y")
+        if sheet_name in existing_sheets:
+            found_sheet = sheet_name
+            found_date = work_day
+            break
+    
+    if not found_sheet:
+        logger.debug("Аркуш наступного прийомного дня не знайдено")
+        context.bot_data.pop('sheet_detected_at', None)
+        context.bot_data.pop('next_reception_sheet', None)
+        context.bot_data.pop('next_reception_date', None)
+        return
+    
+    kyiv_tz = timezone('Europe/Kyiv')
+    now = datetime.datetime.now(kyiv_tz)
+    
+    if context.bot_data.get('next_reception_sheet') != found_sheet:
+        context.bot_data['sheet_detected_at'] = now
+        context.bot_data['next_reception_sheet'] = found_sheet
+        context.bot_data['next_reception_date'] = found_date
+        logger.info(f"Виявлено новий аркуш: {found_sheet}, чекаємо 30 хвилин...")
+        return
+    
+    detected_at = context.bot_data.get('sheet_detected_at')
+    if detected_at:
+        elapsed = now - detected_at
+        if elapsed >= datetime.timedelta(minutes=30):
+            logger.info(f"Минуло 30 хвилин з моменту виявлення аркуша {found_sheet}, запускаємо опитування")
+            await send_visit_poll(context)
+            context.bot_data['poll_sent_for_date'] = datetime.date.today()
+        else:
+            remaining = 30 - (elapsed.total_seconds() / 60)
+            logger.debug(f"До відправки опитування залишилось {remaining:.1f} хвилин")
+
+
+async def send_visit_poll(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Надсилає опитування всім користувачам записаним на наступний прийомний день.
+    """
+    next_reception_sheet = context.bot_data.get('next_reception_sheet')
+    next_reception_date = context.bot_data.get('next_reception_date')
+    
+    if not next_reception_sheet or not next_reception_date:
+        logger.error("Дані про наступний прийомний день відсутні")
+        return
+    
+    logger.info(f"Надсилаємо опитування для дати {next_reception_sheet}")
+    
+    users = get_users_for_date_from_active_sheet(next_reception_sheet)
+    
+    if not users:
+        logger.info(f"Користувачів для опитування на {next_reception_sheet} не знайдено")
+        return
+    
+    for user in users:
+        user_id = user['id']
+        tg_id = user['tg_id']
+        
+        if not tg_id:
+            logger.debug(f"TG ID для користувача {user_id} не знайдено, пропускаємо")
+            continue
+        
+        try:
+            await context.bot.send_message(
+                chat_id=tg_id,
+                text=get_poll_text(user_id, next_reception_sheet),
+                reply_markup=get_poll_keyboard(user_id),
+                parse_mode="HTML"
+            )
+            logger.info(f"Опитування надіслано користувачу {user_id} (TG: {tg_id})")
+        except Exception as e:
+            logger.error(f"Помилка надсилання опитування користувачу {user_id} (TG: {tg_id}): {e}")
+    
+    logger.info(f"Опитування надіслано {len(users)} користувачам")
+
+    
+def get_poll_keyboard(user_id: str) -> InlineKeyboardMarkup:
+    """Повертає клавіатуру для опитування."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Підтвердити візит", callback_data=f"{POLL_CONFIRM}_{user_id}")],
+        [InlineKeyboardButton("Перенести запис", callback_data=f"{POLL_RESCHEDULE}_{user_id}")],
+        [InlineKeyboardButton("Скасувати запис", callback_data=f"{POLL_CANCEL}_{user_id}")]
+    ])
+
+
+def get_poll_text(user_id: str, date: str) -> str:
+    """Повертає текст опитування."""
+    return (
+        f"<b>Опитування щодо візиту</b>\n\n"
+        f"Ваш номер: <code>{user_id}</code>\n"
+        f"Дата візиту: <code>{date}</code>\n\n"
+        f"Будь ласка, підтвердіть свій візит або оберіть іншу дію:"
+    )
+
+
 async def delete_confirmation_message(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Видаляє повідомлення-опитування, якщо користувач не відреагував."""
     job_data = context.job.data
@@ -2157,50 +2685,420 @@ async def delete_confirmation_message(context: ContextTypes.DEFAULT_TYPE) -> Non
         logger.error(f"Помилка при видаленні повідомлення опитування: {e}")
 
 async def handle_poll_response(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Обробляє відповіді на опитування про візит.
+    Підтримує: poll_confirm, poll_reschedule, poll_cancel, poll_date, poll_cancel_confirm
+    """
+    global queue_df
     query = update.callback_query
     await query.answer()
 
     user_tg_id = str(query.from_user.id)
     callback_data = query.data
-    match = re.match(r'(confirm_yes|confirm_no)_(.+)', callback_data)
-    response, user_id = match.groups()
-    #response, user_id = callback_data.split("_", 1)
     
-    # Видаляємо опитування після відповіді
+    kyiv_tz = timezone('Europe/Kyiv')
+    now = datetime.datetime.now(kyiv_tz)
+    next_reception_date = context.bot_data.get('next_reception_date')
+    
+    if next_reception_date:
+        deadline = datetime.datetime.combine(next_reception_date, datetime.time(hour=7, minute=30))
+        deadline = kyiv_tz.localize(deadline)
+        if now >= deadline:
+            try:
+                await query.message.edit_text(
+                    "Час для відповіді на опитування вичерпано.\n"
+                    "Будь ласка, використовуйте основне меню для керування записами.",
+                    reply_markup=None
+                )
+            except Exception:
+                pass
+            logger.info(f"Відповідь на опитування від {user_tg_id} відхилено: дедлайн минув")
+            return
+    
+    if callback_data.startswith(POLL_CONFIRM + "_"):
+        user_id = callback_data.replace(POLL_CONFIRM + "_", "")
+        confirmed_date = context.bot_data.get('next_reception_sheet', '')
+        
+        update_active_sheet_status(user_id, "Підтвердив візит")
+        
+        last_known_state = load_status_state()
+        if user_id in last_known_state:
+            last_known_state[user_id]['confirmation'] = "Підтвердив візит"
+            save_status_state(last_known_state)
+        
+        try:
+            await query.message.edit_text(
+                f"Дякуємо! Ваш візит підтверджено.\n"
+                f"Номер: <code>{user_id}</code>\n"
+                f"Дата: <code>{confirmed_date}</code>",
+                parse_mode="HTML",
+                reply_markup=None
+            )
+        except Exception:
+            pass
+        
+        logger.info(f"Користувач {user_id} підтвердив візит на {confirmed_date}")
+        
+    elif callback_data.startswith(POLL_RESCHEDULE + "_"):
+        user_id = callback_data.replace(POLL_RESCHEDULE + "_", "")
+        
+        today = datetime.date.today()
+        stats_df = await get_stats_data()
+        prediction = calculate_prediction(extract_main_id(user_id), stats_df)
+        
+        inline_kb = date_inline_keyboard_from_prediction(user_id, prediction, today, days_ahead)
+        
+        try:
+            await query.message.edit_text(
+                f"Оберіть нову дату для запису:\n"
+                f"Номер: <code>{user_id}</code>",
+                parse_mode="HTML",
+                reply_markup=inline_kb
+            )
+        except Exception as e:
+            logger.error(f"Помилка відображення дат: {e}")
+    
+    elif callback_data.startswith(POLL_DATE_OTHER + "_"):
+        user_id = callback_data.replace(POLL_DATE_OTHER + "_", "")
+        
+        context.user_data['poll_awaiting_custom_date'] = True
+        context.user_data['poll_reschedule_user_id'] = user_id
+        
+        try:
+            await query.message.edit_text(
+                f"Введіть бажану дату у форматі <code>ДД.ММ.РРРР</code>\n"
+                f"(наприклад, 25.12.2025)\n\n"
+                f"Номер: <code>{user_id}</code>",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Скасувати", callback_data=f"{POLL_CANCEL_RESCHEDULE}_{user_id}")]
+                ])
+            )
+        except Exception as e:
+            logger.error(f"Помилка запиту дати: {e}")
+        
+    elif callback_data.startswith(POLL_DATE + "_"):
+        parts = callback_data.replace(POLL_DATE + "_", "").split("_", 1)
+        if len(parts) == 2:
+            user_id, date_str = parts
+            
+            update_active_sheet_status(user_id, "Відклав візит")
+            
+            try:
+                chosen_date = datetime.datetime.strptime(date_str, "%d.%m.%Y").date()
+            except ValueError:
+                logger.error(f"Некоректний формат дати: {date_str}")
+                return
+            
+            telegram_user_data = {
+                'TG ID': user_tg_id,
+                'TG Name': query.from_user.username if query.from_user.username else '',
+                'TG Full Name': query.from_user.full_name if query.from_user.full_name else ''
+            }
+            
+            new_entry = {
+                'ID': user_id,
+                'Дата': chosen_date.strftime("%d.%m.%Y"),
+                'Примітки': '',
+                'Статус': 'На розгляді',
+                'Змінено': datetime.datetime.now().strftime("%d.%m.%Y %H:%M:%S"),
+                'Попередня дата': context.bot_data.get('next_reception_sheet', ''),
+                **telegram_user_data
+            }
+            
+            new_entry_df = pd.DataFrame([new_entry])
+            if save_queue_data(new_entry_df):
+                queue_df = pd.concat([queue_df, new_entry_df], ignore_index=True)
+                
+                try:
+                    await query.message.edit_text(
+                        f"Заявку на перенесення запису створено.\n"
+                        f"Номер: <code>{user_id}</code>\n"
+                        f"Нова дата: <code>{date_str}</code>\n"
+                        f"Статус: На розгляді",
+                        parse_mode="HTML",
+                        reply_markup=None
+                    )
+                except Exception:
+                    pass
+                
+                notification_text = f"Користувач {query.from_user.mention_html()} подав заявку на перенесення запису для ID <code>{user_id}</code> на <code>{date_str}</code>"
+                await send_group_notification(context, notification_text)
+                
+                logger.info(f"Користувач {user_id} подав заявку на перенесення запису на {date_str}")
+            else:
+                try:
+                    await query.message.edit_text(
+                        "Виникла помилка при перенесенні запису. Спробуйте пізніше.",
+                        reply_markup=None
+                    )
+                except Exception:
+                    pass
+                    
+    elif callback_data.startswith(POLL_CANCEL_CONFIRM + "_"):
+        user_id = callback_data.replace(POLL_CANCEL_CONFIRM + "_", "")
+        
+        update_active_sheet_status(user_id, "Скасував")
+        
+        telegram_user_data = {
+            'TG ID': user_tg_id,
+            'TG Name': query.from_user.username if query.from_user.username else '',
+            'TG Full Name': query.from_user.full_name if query.from_user.full_name else ''
+        }
+        
+        previous_date = context.bot_data.get('next_reception_sheet', '')
+        
+        new_entry = {
+            'ID': user_id,
+            'Дата': '',
+            'Примітки': '',
+            'Статус': 'На розгляді',
+            'Змінено': datetime.datetime.now().strftime("%d.%m.%Y %H:%M:%S"),
+            'Попередня дата': previous_date,
+            **telegram_user_data
+        }
+        
+        new_entry_df = pd.DataFrame([new_entry])
+        if save_queue_data(new_entry_df):
+            queue_df = pd.concat([queue_df, new_entry_df], ignore_index=True)
+            
+            try:
+                await query.message.edit_text(
+                    f"Заявку на скасування запису створено.\n"
+                    f"Номер: <code>{user_id}</code>\n"
+                    f"Статус: На розгляді",
+                    parse_mode="HTML",
+                    reply_markup=None
+                )
+            except Exception:
+                pass
+            
+            notification_text = f"Користувач {query.from_user.mention_html()} подав заявку на скасування запису для ID <code>{user_id}</code>"
+            await send_group_notification(context, notification_text)
+            
+            logger.info(f"Користувач {user_id} подав заявку на скасування запису")
+        else:
+            try:
+                await query.message.edit_text(
+                    "Виникла помилка при скасуванні запису. Спробуйте пізніше.",
+                    reply_markup=None
+                )
+            except Exception:
+                pass
+                
+    elif callback_data.startswith(POLL_CANCEL_ABORT + "_") or callback_data.startswith(POLL_CANCEL_RESCHEDULE + "_"):
+        # Повернення до головного опитування (з підтвердження скасування або з вибору дати)
+        if callback_data.startswith(POLL_CANCEL_ABORT + "_"):
+            user_id = callback_data.replace(POLL_CANCEL_ABORT + "_", "")
+        else:
+            user_id = callback_data.replace(POLL_CANCEL_RESCHEDULE + "_", "")
+        
+        next_reception_sheet = context.bot_data.get('next_reception_sheet', '')
+        
+        try:
+            await query.message.edit_text(
+                get_poll_text(user_id, next_reception_sheet),
+                parse_mode="HTML",
+                reply_markup=get_poll_keyboard(user_id)
+            )
+        except Exception as e:
+            logger.error(f"Помилка повернення до опитування: {e}")
+    
+    elif callback_data.startswith(POLL_CANCEL + "_"):
+        user_id = callback_data.replace(POLL_CANCEL + "_", "")
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Так, скасувати", callback_data=f"{POLL_CANCEL_CONFIRM}_{user_id}")],
+            [InlineKeyboardButton("Ні, повернутися", callback_data=f"{POLL_CANCEL_ABORT}_{user_id}")]
+        ])
+        
+        try:
+            await query.message.edit_text(
+                f"<b>УВАГА!</b> Ви втратите свою чергу!\n\n"
+                f"Номер: <code>{user_id}</code>\n\n"
+                f"Ви впевнені, що хочете скасувати запис?",
+                parse_mode="HTML",
+                reply_markup=keyboard
+            )
+        except Exception as e:
+            logger.error(f"Помилка відображення попередження: {e}")
+    
+
+
+async def handle_poll_custom_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Обробляє введення користувацької дати для перенесення запису через опитування.
+    Використовує ApplicationHandlerStop щоб зупинити fallback.
+    """
+    if not context.user_data.get('poll_awaiting_custom_date'):
+        return  # Не обробляємо, передаємо далі (наступна група)
+    
+    global queue_df
+    user_tg_id = str(update.effective_user.id)
+    date_input = update.message.text.strip()
+    user_id = context.user_data.get('poll_reschedule_user_id', '')
+    
+    context.user_data.pop('poll_awaiting_custom_date', None)
+    context.user_data.pop('poll_reschedule_user_id', None)
+    
+    date_match = re.search(r'(\d{1,2})\.(\d{1,2})\.(\d{2,4})', date_input)
+    if not date_match:
+        await update.message.reply_text(
+            f"Невірний формат дати. Будь ласка, введіть дату у форматі <code>ДД.ММ.РРРР</code>\n"
+            f"Або скористайтеся основним меню для перенесення запису.",
+            parse_mode="HTML",
+            reply_markup=MAIN_KEYBOARD
+        )
+        raise ApplicationHandlerStop
+    
+    day, month, year = date_match.groups()
+    if len(year) == 2:
+        year = '20' + year
+    date_str = f"{day.zfill(2)}.{month.zfill(2)}.{year}"
+    
     try:
-        await query.message.delete()
-    except Exception as e:
-        logger.error(f"Не вдалося видалити опитування після відповіді: {e}")
-       
-    # Визначаємо, яке повідомлення надіслати користувачу
-    user_reply_text = ""
-    notification_text = ""
-    confirmation = ""
-
-    if response == CALLBACK_YES:
-        user_reply_text = "Дякуємо, ваш візит підтверджено!"
-        notification_text = f"✅ Користувач ID <code>{user_id}</code> підтвердив свій візит на завтра."
-        confirmation = "Підтвердив візит"
-    elif response == CALLBACK_NO:
-        user_reply_text = "Ваша відповідь прийнята. Зверніть увагу, що Ваш запис не скасовано. Будь ласка перенесіть або скасуйте запис, не створюйте незручностей тим хто за Вами."
-        notification_text = f"❌ Користувач ID <code>{user_id}</code> відмовився від візиту на завтра\n(запис не скасовано)."
-        confirmation = "Відмовився від візиту"
-
-    # Завантажуємо останній відомий стан
-    last_known_state = load_status_state()
-    if user_id in last_known_state:
-        last_known_state[user_id]['confirmation'] = confirmation
-        save_status_state(last_known_state)
-    else:
-        logger.warning(f"Користувача {user_id} не знайдено в записах.")
+        chosen_date = datetime.datetime.strptime(date_str, "%d.%m.%Y").date()
+    except ValueError:
+        await update.message.reply_text(
+            f"Некоректна дата. Будь ласка, перевірте та спробуйте ще раз.",
+            parse_mode="HTML",
+            reply_markup=MAIN_KEYBOARD
+        )
+        raise ApplicationHandlerStop
     
-    # Надсилаємо сповіщення в груповий чат
-    #if notification_text:
-        #await send_group_notification(context, notification_text)
-
-    # Надсилаємо особисте повідомлення користувачу з основною клавіатурою
-    if user_reply_text:
-        await send_user_notification(context, user_tg_id, user_reply_text)
+    today = datetime.date.today()
+    if chosen_date <= today:
+        await update.message.reply_text(
+            f"Дата має бути в майбутньому. Будь ласка, оберіть іншу дату.",
+            reply_markup=MAIN_KEYBOARD
+        )
+        raise ApplicationHandlerStop
+    
+    if chosen_date.weekday() >= 5:
+        await update.message.reply_text(
+            f"Обрана дата ({date_str}) припадає на вихідний. Будь ласка, оберіть робочий день.",
+            reply_markup=MAIN_KEYBOARD
+        )
+        raise ApplicationHandlerStop
+    
+    # --- ЛОГІКА ПОПЕРЕДЖЕНЬ (аналогічно до основного меню) ---
+    warning_shown = context.user_data.get('poll_warning_shown', False)
+    warned_date_str = context.user_data.get('poll_warned_date')
+    
+    # Очищаємо стан попередження
+    context.user_data.pop('poll_warning_shown', None)
+    context.user_data.pop('poll_warned_date', None)
+    
+    # Якщо це підтвердження тієї самої дати - пропускаємо попередження
+    if not (warning_shown and warned_date_str == date_str):
+        try:
+            import daily_sheets_sync
+            numeric_id = daily_sheets_sync.id_to_numeric(user_id)
+            if numeric_id:
+                prediction = daily_sheets_sync.calculate_prediction_with_daily_data(int(numeric_id))
+                if prediction and prediction.get('dist'):
+                    dist = prediction['dist']
+                    warn_msg = None
+                    
+                    # Обчислюємо ймовірність для обраної дати
+                    chosen_ord = get_ordinal_date(chosen_date)
+                    chosen_prob = stats.t.cdf(chosen_ord + 1, dist['df'], loc=dist['loc'], scale=dist['scale']) * 100
+                    
+                    if chosen_date < prediction['mean'] and chosen_prob < 50:
+                        # Занадто рано - низька ймовірність
+                        try:
+                            prob_mean = calculate_date_probability(prediction['mean'], dist)
+                            range_info = f"{prediction['mean'].strftime('%d.%m.%Y')} ({prob_mean:.0f}%)"
+                        except:
+                            range_info = prediction['mean'].strftime('%d.%m.%Y')
+                        
+                        warn_msg = (
+                            f"⚠️ <b>Попередження:</b> Для обраної дати <code>{date_str}</code> ви маєте "
+                            f"<b>низьку ймовірність</b> почати ВЛК ({chosen_prob:.0f}%).\n"
+                            f"Рекомендовано обирати дату від {range_info}."
+                        )
+                    elif chosen_date > prediction['h90']:
+                        # Занадто далеко в майбутньому
+                        current_start = today + datetime.timedelta(days=1)
+                        while current_start.weekday() >= 5:
+                            current_start += datetime.timedelta(days=1)
+                        
+                        standard_window_end = calculate_end_date(current_start, 15)
+                        threshold_date = max(prediction['h90'], standard_window_end)
+                        
+                        if chosen_date > threshold_date:
+                            example_date = prediction['h90'] if prediction['h90'] >= current_start else current_start
+                            try:
+                                example_prob = calculate_date_probability(example_date, dist)
+                                example_str = f"{example_prob:.0f}% для {example_date.strftime('%d.%m.%Y')}"
+                            except:
+                                example_str = example_date.strftime('%d.%m.%Y')
+                            
+                            warn_msg = (
+                                f"⚠️ <b>Попередження:</b> Обрана дата <code>{date_str}</code> <b>занадто далеко в майбутньому</b>. "
+                                f"Вам не треба так довго чекати, шанс успішно почати ВЛК майже гарантований для ближчих дат ({example_str})."
+                            )
+                    
+                    if warn_msg:
+                        context.user_data['poll_warning_shown'] = True
+                        context.user_data['poll_warned_date'] = date_str
+                        context.user_data['poll_awaiting_custom_date'] = True
+                        context.user_data['poll_reschedule_user_id'] = user_id
+                        
+                        await update.message.reply_text(
+                            f"{warn_msg}\n\nЯкщо ви бажаєте залишити цю дату, введіть її ще раз.",
+                            parse_mode="HTML"
+                        )
+                        raise ApplicationHandlerStop
+        except ApplicationHandlerStop:
+            raise  # Не перехоплюємо ApplicationHandlerStop
+        except Exception as e:
+            logger.warning(f"Помилка перевірки дати для попередження в poll: {e}")
+    
+    update_active_sheet_status(user_id, "Відклав візит")
+    
+    telegram_user_data = {
+        'TG ID': user_tg_id,
+        'TG Name': update.effective_user.username if update.effective_user.username else '',
+        'TG Full Name': update.effective_user.full_name if update.effective_user.full_name else ''
+    }
+    
+    previous_date = context.bot_data.get('next_reception_sheet', '')
+    
+    new_entry = {
+        'ID': user_id,
+        'Дата': chosen_date.strftime("%d.%m.%Y"),
+        'Примітки': '',
+        'Статус': 'На розгляді',
+        'Змінено': datetime.datetime.now().strftime("%d.%m.%Y %H:%M:%S"),
+        'Попередня дата': previous_date,
+        **telegram_user_data
+    }
+    
+    new_entry_df = pd.DataFrame([new_entry])
+    if save_queue_data(new_entry_df):
+        queue_df = pd.concat([queue_df, new_entry_df], ignore_index=True)
+        
+        await update.message.reply_text(
+            f"Заявку на перенесення запису створено.\n"
+            f"Номер: <code>{user_id}</code>\n"
+            f"Нова дата: <code>{date_str}</code>\n"
+            f"Статус: На розгляді",
+            parse_mode="HTML",
+            reply_markup=MAIN_KEYBOARD
+        )
+        
+        notification_text = f"Користувач {update.effective_user.mention_html()} подав заявку на перенесення запису для ID <code>{user_id}</code> на <code>{date_str}</code>"
+        await send_group_notification(context, notification_text)
+        
+        logger.info(f"Користувач {user_id} подав заявку на перенесення запису на {date_str} (ручне введення)")
+    else:
+        await update.message.reply_text(
+            "Виникла помилка при перенесенні запису. Спробуйте пізніше.",
+            reply_markup=MAIN_KEYBOARD
+        )
+    
+    raise ApplicationHandlerStop
         
 # --- ЗАГАЛЬНІ ФУНКЦІЇ ДЛЯ РОЗМОВИ ---
 
@@ -2220,7 +3118,7 @@ async def fallback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Будь ласка, дотримуйтесь інструкцій або скористайтеся кнопкою `Скасувати ввід`.",
         parse_mode='Markdown',
-        reply_markup=MAIN_KEYBOARD # Додаємо клавіатуру
+        reply_markup=MAIN_KEYBOARD
     )
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2266,37 +3164,53 @@ def main() -> None:
    )
     # Register the error handler
     application.add_error_handler(error_handler)
-    # Обробник для /start завжди CommandHandler
+    # Обробник для /start та /help
     application.add_handler(CommandHandler("start", start, filters=filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("help", help_command, filters=filters.ChatType.PRIVATE))
     # Обробники команд для керування адміністраторами
     application.add_handler(CommandHandler("grant_admin", grant_admin, filters=filters.ChatType.PRIVATE))
     application.add_handler(CommandHandler("drop_admin", drop_admin, filters=filters.ChatType.PRIVATE))
     # Обробники команд для керування списком заблокованих
     application.add_handler(CommandHandler("ban", ban, filters=filters.ChatType.PRIVATE))
     application.add_handler(CommandHandler("unban", unban, filters=filters.ChatType.PRIVATE))
+    # Обробник команди для тестування опитування
+    application.add_handler(CommandHandler("test_poll", test_poll, filters=filters.ChatType.PRIVATE))
+    
+    # Команди для ручного запуску запланованих завдань (доступні адмінам)
+    application.add_handler(CommandHandler("run_cleanup", run_cleanup_command, filters=filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("run_notify", run_notify_command, filters=filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("run_reminder", run_reminder_command, filters=filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("run_check_sheet", run_check_sheet_command, filters=filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("run_poll", run_poll_command, filters=filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("env", show_environment_command, filters=filters.ChatType.PRIVATE))
 
     # --- ConversationHandlers повинні бути додані ПЕРШИМИ ---
     # Це дає їм пріоритет над іншими MessageHandler, коли розмова активна.
 
     # Обробник для кнопки "Скасувати ввід"
     cancel_button_handler = MessageHandler(filters.TEXT & filters.Regex(BUTTON_TEXT_CANCEL_OP) & filters.ChatType.PRIVATE, cancel_conversation)
+    
+    # Загальний fallback для ConversationHandlers - ловить невідомий ввід всередині розмови
+    conv_fallback_handler = MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, fallback)
 
     join_conv_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.TEXT & filters.Regex(BUTTON_TEXT_JOIN) & filters.ChatType.PRIVATE, join_start)],
         states={
             JOIN_GETTING_ID: [
-                cancel_button_handler, # Переміщуємо на початок списку
+                cancel_button_handler,
                 MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, join_get_id)
             ],
             JOIN_GETTING_DATE: [
-                cancel_button_handler, # Переміщуємо на початок списку
+                cancel_button_handler,
                 MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, join_get_date)
             ],
         },
         fallbacks=[
-            CommandHandler("cancel", cancel_conversation, filters=filters.ChatType.PRIVATE) # Залишаємо на випадок ручного вводу /cancel
+            cancel_button_handler,
+            CommandHandler("cancel", cancel_conversation, filters=filters.ChatType.PRIVATE),
+            conv_fallback_handler,
         ],
-        conversation_timeout=3600,  # Timeout in seconds (e.g., 3600 seconds)
+        conversation_timeout=3600,
         allow_reentry=True
     )
 
@@ -2304,14 +3218,16 @@ def main() -> None:
         entry_points=[MessageHandler(filters.TEXT & filters.Regex(BUTTON_TEXT_CANCEL_RECORD) & filters.ChatType.PRIVATE, cancel_record_start)],
         states={
             CANCEL_GETTING_ID: [
-                cancel_button_handler, # Переміщуємо на початок списку
+                cancel_button_handler,
                 MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, cancel_record_get_id)
             ],
         },
         fallbacks=[
-            CommandHandler("cancel", cancel_conversation, filters=filters.ChatType.PRIVATE)
+            cancel_button_handler,
+            CommandHandler("cancel", cancel_conversation, filters=filters.ChatType.PRIVATE),
+            conv_fallback_handler,
         ],
-        conversation_timeout=3600,  # Timeout in seconds (e.g., 3600 seconds)
+        conversation_timeout=3600,
         allow_reentry=True
     )
 
@@ -2319,18 +3235,20 @@ def main() -> None:
         entry_points=[MessageHandler(filters.TEXT & filters.Regex(BUTTON_TEXT_SHOW) & filters.ChatType.PRIVATE, show_start)],
         states={
             SHOW_GETTING_OPTION: [
-                cancel_button_handler, # Переміщуємо на початок списку
+                cancel_button_handler,
                 MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, show_get_option)
             ],
             SHOW_GETTING_DATE: [
-                cancel_button_handler, # Переміщуємо на початок списку
+                cancel_button_handler,
                 MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, show_get_date)
             ],
         },
         fallbacks=[
-            CommandHandler("cancel", cancel_conversation, filters=filters.ChatType.PRIVATE)
+            cancel_button_handler,
+            CommandHandler("cancel", cancel_conversation, filters=filters.ChatType.PRIVATE),
+            conv_fallback_handler,
         ],
-        conversation_timeout=3600,  # Timeout in seconds (e.g., 3600 seconds)
+        conversation_timeout=3600,
         allow_reentry=True
     )
 
@@ -2338,14 +3256,16 @@ def main() -> None:
         entry_points=[MessageHandler(filters.TEXT & filters.Regex(BUTTON_TEXT_STATUS) & filters.ChatType.PRIVATE, status_start)],
         states={
             STATUS_GETTING_ID: [
-                cancel_button_handler, # Переміщуємо на початок списку
+                cancel_button_handler,
                 MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, status_get_id)
             ],
         },
         fallbacks=[
-            CommandHandler("cancel", cancel_conversation, filters=filters.ChatType.PRIVATE)
+            cancel_button_handler,
+            CommandHandler("cancel", cancel_conversation, filters=filters.ChatType.PRIVATE),
+            conv_fallback_handler,
         ],
-        conversation_timeout=3600,  # Timeout in seconds (e.g., 3600 seconds)
+        conversation_timeout=3600,
         allow_reentry=True
     )
 
@@ -2354,10 +3274,18 @@ def main() -> None:
     application.add_handler(show_conv_handler)
     application.add_handler(status_conv_handler)
     application.add_handler(CallbackQueryHandler(handle_poll_response, pattern="^confirm_"))
+    application.add_handler(CallbackQueryHandler(handle_poll_response, pattern=f"^{POLL_CONFIRM}_"))
+    application.add_handler(CallbackQueryHandler(handle_poll_response, pattern=f"^{POLL_RESCHEDULE}_"))
+    application.add_handler(CallbackQueryHandler(handle_poll_response, pattern=f"^{POLL_CANCEL}_"))
+    application.add_handler(CallbackQueryHandler(handle_poll_response, pattern=f"^{POLL_DATE_OTHER}_"))
+    application.add_handler(CallbackQueryHandler(handle_poll_response, pattern=f"^{POLL_DATE}_"))
+    application.add_handler(CallbackQueryHandler(handle_poll_response, pattern=f"^{POLL_CANCEL_CONFIRM}_"))
+    application.add_handler(CallbackQueryHandler(handle_poll_response, pattern=f"^{POLL_CANCEL_ABORT}_"))
+    application.add_handler(CallbackQueryHandler(handle_poll_response, pattern=f"^{POLL_CANCEL_RESCHEDULE}_"))
     
     # --- Загальні обробники для окремих кнопок (НЕ розмов) ---
     # Вони мають бути після ConversationHandler, але до загального fallback
-    application.add_handler(MessageHandler(filters.TEXT & filters.Regex(BUTTON_TEXT_OPEN_SHEET) & filters.ChatType.PRIVATE, open_sheet_command))
+    application.add_handler(CommandHandler("sheet", open_sheet_command, filters=filters.ChatType.PRIVATE))
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex(BUTTON_TEXT_PREDICTION) & filters.ChatType.PRIVATE, prediction_command))
     #application.add_handler(MessageHandler(filters.TEXT & filters.Regex(BUTTON_TEXT_CLEAR_QUEUE), clear_queue_command))
     # Обробник кнопки "Скасувати ввід" поза розмовами.
@@ -2365,46 +3293,69 @@ def main() -> None:
     # і також як окремий обробник тут, щоб спрацьовувати, якщо користувач просто натисне її,
     # коли немає активної розмови, і таким чином повернути MAIN_KEYBOARD.
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex(BUTTON_TEXT_CANCEL_OP) & filters.ChatType.PRIVATE, cancel_conversation)) # Обробник кнопки "Скасувати ввід" поза розмовами
-
+    
+    # Обробник введення дати для опитування (перевіряє context.user_data['poll_awaiting_custom_date'])
+    # group=-1: спрацьовує ПЕРЕД group=0 (ConversationHandlers, fallback)
+    # Якщо poll_awaiting_custom_date встановлено - обробляє і робить raise ApplicationHandlerStop
+    # Якщо ні - просто return, і group=0 продовжить обробку
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_poll_custom_date), group=-1)
+    
     # --- Загальний fallback обробник ---
-    # Цей обробник має бути ДОДАНИЙ ОСТАННІМ!
-    # Він ловить ВСЕ, що не було оброблено попередніми обробниками.
+    # Спрацьовує останнім в group=0 для повідомлень поза ConversationHandlers
+    # Всередині ConversationHandlers fallback обробляється через conv_fallback_handler
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, fallback))
 
     # --- Налаштування планувальника ---
     kyiv_tz = timezone('Europe/Kyiv')        
     
-    # Це завдання буде запускатися щоденно о 3:00
-    application.job_queue.run_daily(
-        callback=perform_queue_cleanup,
-        time=datetime.time(hour=3, minute=0, tzinfo=kyiv_tz),
-        name="Daily Queue Cleanup"
-    )
-    logger.info(f"Завдання 'Daily Queue Cleanup' заплановано щоденно о 03:00 за {kyiv_tz.tzname(datetime.datetime.now())}")
+    # Заплановані завдання запускаються тільки в production оточенні
+    if ENVIRONMENT == "production":
+        # Це завдання буде запускатися щоденно о 3:00
+        application.job_queue.run_daily(
+            callback=perform_queue_cleanup,
+            time=datetime.time(hour=3, minute=0, tzinfo=kyiv_tz),
+            name="Daily Queue Cleanup"
+        )
+        logger.info(f"Завдання 'Daily Queue Cleanup' заплановано щоденно о 03:00 за {kyiv_tz.tzname(datetime.datetime.now())}")
 
-    # Це завдання буде запускатися щоденно о 7:10
-    application.job_queue.run_daily(
-        callback=date_reminder,
-        time=datetime.time(hour=7, minute=10, tzinfo=kyiv_tz),
-        job_kwargs={'misfire_grace_time': 30 * 60}, # Дозволяє пропустити запуск, якщо бот був офлайн
-        name="Visit Reminder"
-    )
-    logger.info(f"Завдання 'Visit Reminder' заплановано щоденно о 07:10 за {kyiv_tz.tzname(datetime.datetime.now())}")
-    
-    # Запускаємо кожні 30 хвилин. Сама функція перевірить, чи час підходить.
-    application.job_queue.run_repeating(
-        callback=notify_status,
-        interval=datetime.timedelta(minutes=5),
-        first=datetime.time(hour=7, minute=3, tzinfo=kyiv_tz), # Перший запуск о 7:00
-        last=datetime.time(hour=23, minute=33, tzinfo=kyiv_tz), # Останній запуск о 23:30
-        name="Status Change Notification"
-    )
-    logger.info(f"Завдання 'Status Change Notification' заплановано кожні 30 хвилин з 07:00 по 23:30 за {kyiv_tz.tzname(datetime.datetime.now())}")
+        # Це завдання буде запускатися щоденно о 7:10
+        application.job_queue.run_daily(
+            callback=date_reminder,
+            time=datetime.time(hour=7, minute=10, tzinfo=kyiv_tz),
+            job_kwargs={'misfire_grace_time': 30 * 60},
+            name="Visit Reminder"
+        )
+        logger.info(f"Завдання 'Visit Reminder' заплановано щоденно о 07:10 за {kyiv_tz.tzname(datetime.datetime.now())}")
+        
+        # Запускаємо кожні 5 хвилин
+        application.job_queue.run_repeating(
+            callback=notify_status,
+            interval=datetime.timedelta(minutes=5),
+            first=datetime.time(hour=7, minute=3, tzinfo=kyiv_tz),
+            last=datetime.time(hour=23, minute=33, tzinfo=kyiv_tz),
+            name="Status Change Notification"
+        )
+        logger.info(f"Завдання 'Status Change Notification' заплановано кожні 5 хвилин з 07:00 по 23:30 за {kyiv_tz.tzname(datetime.datetime.now())}")
+        
+        application.job_queue.run_repeating(
+            callback=check_new_daily_sheet,
+            interval=datetime.timedelta(minutes=5),
+            first=datetime.time(hour=15, minute=0, tzinfo=kyiv_tz),
+            last=datetime.time(hour=23, minute=0, tzinfo=kyiv_tz),
+            name="Check New Daily Sheet"
+        )
+        logger.info(f"Завдання 'Check New Daily Sheet' заплановано кожні 5 хвилин з 15:00 по 23:00 за {kyiv_tz.tzname(datetime.datetime.now())}")
+    else:
+        logger.info(f"Оточення: {ENVIRONMENT} - заплановані завдання ВИМКНЕНО. Використовуйте команди /run_* для ручного запуску.")
     
     # --- Запуск бота з обробкою зупинки ---
     logger.info("Присвячується добровольцям і волонтерам.")
-    logger.info("Бот запису в електронну чергу на ВЛК Закревського,81/1 запущено...") # Переміщено сюди
-    logger.info("Планувальник APScheduler запущено.")
+    env_label = "ТЕСТОВЕ" if ENVIRONMENT == "test" else "ПРОДУКТОВЕ"
+    logger.info(f"Бот запису в електронну чергу на ВЛК Закревського,81/1 запущено ({env_label} оточення)...")
+    if ENVIRONMENT == "production":
+        logger.info("Планувальник APScheduler запущено з усіма завданнями.")
+    else:
+        logger.info("Планувальник APScheduler запущено БЕЗ автоматичних завдань. Використовуйте /run_* для ручного запуску.")
     try:
         application.run_polling(allowed_updates=Update.ALL_TYPES)
     except ConnectError as e:

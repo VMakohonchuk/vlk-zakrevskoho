@@ -123,13 +123,14 @@ def download_daily_sheet(sheets_service, stats_sheet_id, sheet_name, retry_delay
     
     return False
 
+SYNC_CACHE_TTL_MINUTES = 30
+
 def sync_daily_sheets(sheets_service, stats_sheet_id, stats_worksheet_name, force_refresh_stats=False, force_refresh_all_sheets=False):
     """
     Синхронізує щоденні аркуші на основі колонки "Аркуш" зі stats.
     Оновлює stats якщо він застарів або force_refresh_stats=True.
     
-    ВАЖЛИВО: Завжди перезавантажує останні 5 днів, щоб захопити оновлення
-    які адміністратори могли внести протягом дня після попередньої синхронізації.
+    Використовує TTL кешування (30 хв) для уникнення частих API запитів.
     
     Args:
         sheets_service: Google Sheets API service
@@ -139,6 +140,16 @@ def sync_daily_sheets(sheets_service, stats_sheet_id, stats_worksheet_name, forc
         force_refresh_all_sheets: Примусово перезавантажити ВСІ щоденні аркуші
     """
     ensure_cache_dir()
+    
+    attendance_file = os.path.join(os.path.dirname(__file__), "attendance_data.json")
+    
+    if not force_refresh_stats and not force_refresh_all_sheets and os.path.exists(attendance_file):
+        mod_time = datetime.datetime.fromtimestamp(os.path.getmtime(attendance_file))
+        age_minutes = (datetime.datetime.now() - mod_time).total_seconds() / 60
+        
+        if age_minutes < SYNC_CACHE_TTL_MINUTES:
+            logger.debug(f"Синхронізація пропущена (кеш свіжий, вік: {age_minutes:.1f} хв)")
+            return True
     
     stats_file = os.path.join(DAILY_SHEETS_CACHE_DIR, "_stats.csv")
     should_refresh = force_refresh_stats
@@ -220,6 +231,8 @@ def sync_daily_sheets(sheets_service, stats_sheet_id, stats_worksheet_name, forc
     if sheets_updated or should_refresh:
         logger.info("Оновлення attendance_data.json...")
         generate_attendance_json()
+    elif os.path.exists(attendance_file):
+        os.utime(attendance_file, None)
     
     return True
 
