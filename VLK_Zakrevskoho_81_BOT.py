@@ -1216,18 +1216,21 @@ async def perform_queue_cleanup(logger_info_prefix: str = "Очищення за
     current_date_obj = datetime.date.today() # Поточна дата
     unique_ids = sort_df['ID'].unique()
     index_to_drop = []
-    index_to_drop.extend(sort_df.loc[(sort_df['Дата_dt'].dt.date < current_date_obj) & (sort_df['Дата_dt'].notna())].index.tolist())
+    # index_to_drop.extend(sort_df.loc[(sort_df['Дата_dt'].dt.date < current_date_obj) & (sort_df['Дата_dt'].notna())].index.tolist())
+    index_to_drop.extend(sort_df.loc[(sort_df['Статус_clean'].isin(['відхилено'])].index.tolist())
+    
   
     for cur_id in unique_ids:
         max_mod_idx = sort_df[sort_df['ID'] == cur_id]['Змінено_dt'].idxmax()
         TG_ID = sort_df['TG ID'][max_mod_idx].strip()
-        index_to_drop.extend(sort_df.loc[(sort_df['ID'] == cur_id) & (sort_df['Змінено_dt'] < sort_df['Змінено_dt'][max_mod_idx]) & ((sort_df['Дата_dt'].dt.date >= current_date_obj) | (sort_df['Дата_dt'].isna())) & (sort_df['Статус_clean'].isin(['відхилено']))].index.tolist())
-        if  sort_df['Статус_clean'][max_mod_idx] == 'ухвалено':
+        # index_to_drop.extend(sort_df.loc[(sort_df['ID'] == cur_id) & (sort_df['Змінено_dt'] < sort_df['Змінено_dt'][max_mod_idx]) & ((sort_df['Дата_dt'].dt.date >= current_date_obj) | (sort_df['Дата_dt'].isna())) & (sort_df['Статус_clean'].isin(['відхилено']))].index.tolist())
+        index_to_drop.extend(sort_df.loc[(sort_df['ID'] == cur_id) & (sort_df['Змінено_dt'] < sort_df['Змінено_dt'][max_mod_idx]) & (sort_df['Дата_dt'].dt.date < current_date_obj) & (sort_df['TG ID'] == TG_ID)].index.tolist())
+        if sort_df['Статус_clean'][max_mod_idx] == 'ухвалено':
             index_to_drop.extend(sort_df.loc[(sort_df['ID'] == cur_id) & (sort_df['Змінено_dt'] < sort_df['Змінено_dt'][max_mod_idx]) & (sort_df['Статус_clean'].isin(['на розгляді', 'ухвалено'])) & (sort_df['TG ID'] == TG_ID)].index.tolist())
-            index_to_drop.extend(sort_df.loc[(sort_df['ID'] == cur_id) & (sort_df['Змінено_dt'] < sort_df['Змінено_dt'][max_mod_idx]) & (sort_df['Статус_clean'].isin(['на розгляді', 'ухвалено'])) & (sort_df['TG ID'] != TG_ID) & (sort_df['Дата_dt'].isna())].index.tolist())
+            # index_to_drop.extend(sort_df.loc[(sort_df['ID'] == cur_id) & (sort_df['Змінено_dt'] < sort_df['Змінено_dt'][max_mod_idx]) & (sort_df['Статус_clean'].isin(['на розгляді', 'ухвалено'])) & (sort_df['TG ID'] != TG_ID) & (sort_df['Дата_dt'].isna())].index.tolist())
             if pd.notna(sort_df['Дата_dt'][max_mod_idx]):
                 if sort_df['Дата_dt'].dt.date[max_mod_idx] < current_date_obj:
-                    index_to_drop.extend(sort_df.loc[(sort_df['ID'] == cur_id) & (sort_df['Змінено_dt'] < sort_df['Змінено_dt'][max_mod_idx]) & (sort_df['Статус_clean'].isin(['на розгляді', 'ухвалено'])) & (sort_df['TG ID'] != TG_ID) & (sort_df['Дата_dt'].dt.date >= current_date_obj)].index.tolist())
+                    index_to_drop.extend(sort_df.loc[(sort_df['ID'] == cur_id) & (sort_df['Змінено_dt'] < sort_df['Змінено_dt'][max_mod_idx]) & (sort_df['Статус_clean'].isin(['на розгляді', 'ухвалено'])) & (sort_df['TG ID'] != TG_ID)].index.tolist())
                     
     unique_index_to_drop = list(set(index_to_drop))
     records_to_keep = sort_df.drop(index=unique_index_to_drop).copy()
@@ -1837,16 +1840,16 @@ async def join_get_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     # Оновлений regex для підтримки формату без року (або з роком) на кнопках, але користувач може ввести повну дату
     # Пріоритет: спочатку шукаємо повну дату dd.mm.yyyy або dd.mm.yy
     
-    match_full = re.search(r'(\d{1,2})\.(\d{1,2})\.(\d{4}|\d{2})', date_input)
+    match_full = re.search(r'(\d{1,2})\W(\d{1,2})\W(\d{4}|\d{2})', date_input)
     
     try:
         if match_full:
             date_text = match_full.group(0)
             # Якщо рік має 2 цифри, strptime %y обробить його (як 20xx)
             if len(match_full.group(3)) == 2:
-                 chosen_date = datetime.datetime.strptime(date_text, "%d.%m.%y").date()
+                 chosen_date = datetime.datetime.strptime(match_full.group(1) + '.' + match_full.group(2) + '.' + match_full.group(3), "%d.%m.%y").date()
             else:
-                 chosen_date = datetime.datetime.strptime(date_text, "%d.%m.%Y").date()
+                 chosen_date = datetime.datetime.strptime(match_full.group(1) + '.' + match_full.group(2) + '.' + match_full.group(3), "%d.%m.%Y").date()
         else:
             # Якщо regex не знайшов дату, викликаємо помилку для переходу в except
             raise ValueError()
@@ -2009,7 +2012,7 @@ async def join_get_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         else:
             notification_text = f"✅ Користувач {update.effective_user.mention_html()}\nстворив запис для\nID <code>{user_id}</code> на <code>{chosen_date.strftime('%d.%m.%Y')}</code>" 
         await send_group_notification(context, notification_text)
-        message_text = f"Ви успішно створили заявку на запис/перенос дати в черзі!\nВаш ID: `{user_id}`, Обрана дата: `{chosen_date.strftime('%d.%m.%Y')}`\nСтатус заявки: `На розгляді`\nВаша заявка на розгляді у адміністраторів.\nЯкщо вона буде \"Ухвалена\", то через деякий час з'явиться в жовтій таблиці 🟡TODO."
+        message_text = f"Ви успішно створили заявку на запис/перенесення дати в черзі!\nВаш ID: `{user_id}`, Обрана дата: `{chosen_date.strftime('%d.%m.%Y')}`\nСтатус заявки: `На розгляді`\nВаша заявка на розгляді у адміністраторів.\nЯкщо вона буде \"Ухвалена\", то через деякий час з'явиться в жовтій таблиці 🟡TODO."
         await update.message.reply_text(message_text, parse_mode='Markdown', reply_markup=MAIN_KEYBOARD)
         logger.info(f"Запис користувача {get_user_log_info(update.effective_user)} (ID: {user_id}) оновлено/додано на дату: {chosen_date.strftime('%d.%m.%Y')}. Попередня дата: {previous_state if previous_state else 'новий запис'}")
         context.user_data.clear()
@@ -3330,12 +3333,12 @@ def main() -> None:
         # Запускаємо кожні 5 хвилин
         application.job_queue.run_repeating(
             callback=notify_status,
-            interval=datetime.timedelta(minutes=5),
+            interval=datetime.timedelta(minutes=30),
             first=datetime.time(hour=7, minute=3, tzinfo=kyiv_tz),
             last=datetime.time(hour=23, minute=33, tzinfo=kyiv_tz),
             name="Status Change Notification"
         )
-        logger.info(f"Завдання 'Status Change Notification' заплановано кожні 5 хвилин з 07:00 по 23:30 за {kyiv_tz.tzname(datetime.datetime.now())}")
+        logger.info(f"Завдання 'Status Change Notification' заплановано кожні 30 хвилин з 07:00 по 23:30 за {kyiv_tz.tzname(datetime.datetime.now())}")
         
         application.job_queue.run_repeating(
             callback=check_new_daily_sheet,
