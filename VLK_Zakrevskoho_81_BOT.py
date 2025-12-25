@@ -1890,8 +1890,9 @@ async def join_get_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     # ПЕРЕВІРКА: чи дата співпадає з поточною датою запису
     if previous_state:
         try:
-            previous_date_obj = datetime.datetime.strptime(previous_state, "%d.%m.%Y").date()
-            if chosen_date == previous_date_obj:
+            #previous_date_obj = datetime.datetime.strptime(previous_state, "%d.%m.%Y").date()
+            #if chosen_date == previous_date_obj:
+            if chosen_date.strftime("%d.%m.%Y") == previous_state:
                 logger.warning(f"Користувач {get_user_log_info(update.effective_user)} ввів дату, що співпадає з попереднім записом: '{chosen_date.strftime('%d.%m.%Y')}'")
                 await update.message.reply_text(
                     f"Дата не повинна співпадати з поточною датою запису (`{chosen_date.strftime('%d.%m.%Y')}`). Будь ласка, оберіть іншу дату або скасуйте дію.",
@@ -2303,7 +2304,7 @@ async def show_get_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     """Отримує дату для відображення записів і фільтрує чергу."""
     date_input = update.message.text.strip()
     
-    match = re.search(r'(\d{2})\.(\d{2})\.(\d{2,4})', date_input)
+    match = re.search(r'(\d{2})\W(\d{2})\W(\d{2,4})', date_input)
     if match:
         date_text = match.group(0)
         try:
